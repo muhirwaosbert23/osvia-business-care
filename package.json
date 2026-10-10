@@ -1,14 +1,21 @@
 {
   "name": "osvia-business-care",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OSVIA Business Care local support portal",
+  "description": "OSVIA Business Care managed IT support portal",
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
-    "start": "node --experimental-sqlite server/index.js",
-    "test": "node --experimental-sqlite --test test/workflows.test.js"
+    "start": "node --experimental-sqlite --no-warnings=ExperimentalWarning server/index.js",
+    "test": "node --experimental-sqlite --no-warnings=ExperimentalWarning --test --test-concurrency=1 test/sla.test.js test/integrations.test.js test/workflows.test.js",
+    "backup": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/backup.js",
+    "restore": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/restore.js",
+    "migrate:check": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/migrate-check.js",
+    "loadtest": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/loadtest.js"
+  },
+  "dependencies": {
+    "nodemailer": "10.0.16"
   }
 }

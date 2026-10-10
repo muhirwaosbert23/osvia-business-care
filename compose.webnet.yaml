@@ -1,0 +1,9 @@
+services:
+  portal:
+    networks:
+      - default
+      - webnet
+
+networks:
+  webnet:
+    external: true

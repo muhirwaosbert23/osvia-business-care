@@ -5,10 +5,10 @@ import { HttpError } from "./errors.js";
 export function assertHost(value) {
   const host = String(value || "").trim();
   if (!host) return "";
-  if (host.length > 253 || !/^[A-Za-z0-9.-]+$/.test(host) || host.startsWith(".") || host.endsWith(".") || host.includes("..")) {
+  if (host.length > 253 || !/^[A-Za-z0-9.:-]+$/.test(host) || host.startsWith(".") || host.startsWith("-") || host.endsWith(".") || host.includes("..")) {
     throw new HttpError(400, "Enter an IP address or hostname.");
   }
-  if (host === "0.0.0.0" || host === "169.254.169.254") {
+  if (["0.0.0.0", "::", "169.254.169.254"].includes(host) || host.startsWith("169.254.")) {
     throw new HttpError(400, "That address cannot be checked.");
   }
   return host;
@@ -33,8 +33,12 @@ export function tcpOpen(host, port, timeoutMs) {
 
 export function pingHost(host) {
   return new Promise((resolve) => {
+    if (host.startsWith("-")) {
+      resolve(false);
+      return;
+    }
     const args = process.platform === "win32" ? ["-n", "1", "-w", "1500", host] : ["-c", "1", "-W", "2", host];
-    const child = spawn("ping", args, { windowsHide: true });
+    const child = spawn("ping", args, { windowsHide: true, stdio: "ignore" });
     const timer = setTimeout(() => {
       child.kill();
       resolve(false);

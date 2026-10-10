@@ -1,66 +1,66 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { createApp } from "./app.js";
-import { refreshDevices } from "./checks.js";
 import { openDatabase } from "./db.js";
-import { runReminders } from "./jobs.js";
+import { loadEnv, projectRoot } from "./env.js";
+import { startScheduler } from "./jobs.js";
+import { initAppSecret } from "./security.js";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-loadEnv(path.join(root, ".env"));
+loadEnv(path.join(projectRoot, ".env"));
 
-const dataDir = path.resolve(root, process.env.DATA_DIR || "data");
+const dataDir = path.resolve(projectRoot, process.env.DATA_DIR || "data");
+process.env.DATA_DIR = dataDir;
 fs.mkdirSync(dataDir, { recursive: true });
-const db = openDatabase(path.join(dataDir, "osvia.sqlite"));
+const backupDir = path.join(dataDir, "backups");
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 3080);
-const server = createApp(db);
 
-server.on("error", (error) => {
-  if (error.code === "EADDRINUSE") {
-    console.error(`Port ${port} is already in use.`);
+if (process.env.NODE_ENV === "production") {
+  const problems = [];
+  if (process.env.COOKIE_SECURE !== "true") problems.push("COOKIE_SECURE must be true behind HTTPS.");
+  if (!process.env.APP_URL?.startsWith("https://")) problems.push("APP_URL must be the public https:// address.");
+  if (process.env.REQUIRE_STAFF_MFA === "false") problems.push("REQUIRE_STAFF_MFA cannot be false in production.");
+  if (problems.length) {
+    console.error(`Refusing to start in production:\n- ${problems.join("\n- ")}`);
     process.exit(1);
   }
-  console.error(error);
+}
+
+initAppSecret(dataDir);
+const db = openDatabase(path.join(dataDir, "osvia.sqlite"), { backupDir });
+const server = createApp(db);
+server.headersTimeout = 20000;
+server.requestTimeout = 60000;
+
+server.on("error", (error) => {
+  console.error(error.code === "EADDRINUSE" ? `Port ${port} is already in use.` : error);
   process.exit(1);
 });
 
+let scheduler = null;
 server.listen(port, host, () => {
   console.log(`OSVIA Business Care is running at http://${host}:${port}`);
+  if (process.env.DISABLE_JOBS !== "true") scheduler = startScheduler(db, { backupDir });
 });
 
-runReminders(db);
-const timer = setInterval(() => runReminders(db), 60 * 60 * 1000);
-timer.unref();
-
-let checking = false;
-async function checkDevices() {
-  if (checking) return;
-  checking = true;
-  try {
-    await refreshDevices(db);
-  } catch (error) {
-    console.error(error);
-  } finally {
-    checking = false;
-  }
-}
-checkDevices();
-const reachabilityTimer = setInterval(checkDevices, 60 * 1000);
-reachabilityTimer.unref();
-
-function loadEnv(file) {
-  if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const index = trimmed.indexOf("=");
-    if (index < 1) continue;
-    const key = trimmed.slice(0, index).trim();
-    let value = trimmed.slice(index + 1).trim();
-    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
+let stopping = false;
+function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  console.log(`${signal} received, shutting down.`);
+  scheduler?.stop();
+  server.close(() => {
+    db.close();
+    process.exit(0);
+  });
+  setTimeout(() => {
+    try {
+      db.close();
+    } catch {
+      /* already closed */
     }
-    if (process.env[key] === undefined) process.env[key] = value;
-  }
+    process.exit(0);
+  }, 8000).unref();
 }
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

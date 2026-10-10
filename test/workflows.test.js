@@ -1,374 +1,358 @@
-import { strict as assert } from "node:assert";
-import net from "node:net";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import test from "node:test";
-import { DatabaseSync } from "node:sqlite";
-import { createApp } from "../server/app.js";
-import { backupDatabase } from "../server/backup.js";
-import { openDatabase } from "../server/db.js";
-import { runReminders } from "../server/jobs.js";
+import assert from "node:assert/strict";
+import { after, before, describe, test } from "node:test";
+import { totpCode } from "../server/security.js";
+import { bootstrap, Client, PASSWORD, startServer } from "./helpers.js";
 
-async function start() {
-  const dir = mkdtempSync(path.join(tmpdir(), "osvia-"));
-  const db = openDatabase(path.join(dir, "app.sqlite"));
-  const server = createApp(db);
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
+const PNG = Buffer.from("89504e470d0a1a0a0000000d4948445200000001000000010806000000", "hex");
 
-  function client() {
-    const jar = new Map();
-    return {
-      jar,
-      async call(method, pathname, body) {
-        const headers = { Accept: "application/json" };
-        if (body !== undefined) headers["Content-Type"] = "application/json";
-        if (jar.get("sid")) headers.Cookie = `osvia_session=${jar.get("sid")}`;
-        if (jar.get("csrf") && method !== "GET") headers["X-CSRF-Token"] = jar.get("csrf");
-        const response = await fetch(base + pathname, {
-          method,
-          headers,
-          body: body === undefined ? undefined : JSON.stringify(body),
-        });
-        for (const cookie of response.headers.getSetCookie?.() || []) {
-          const [pair] = cookie.split(";");
-          const [key, value] = pair.split("=");
-          if (key === "osvia_session") jar.set("sid", decodeURIComponent(value || ""));
-        }
-        const text = await response.text();
-        let data = {};
-        if (text && (response.headers.get("content-type") || "").includes("json")) data = JSON.parse(text);
-        if (data.csrfToken) jar.set("csrf", data.csrfToken);
-        return { status: response.status, data, text, type: response.headers.get("content-type") };
-      },
-    };
+let env;
+let ctx;
+
+before(async () => {
+  env = await startServer();
+  ctx = await bootstrap(env.base);
+});
+
+after(async () => {
+  await env.close();
+});
+
+describe("authentication", () => {
+  test("setup only works once", async () => {
+    const res = await new Client(env.base).post("/api/setup", { name: "X", email: "x@osvia.test", password: PASSWORD });
+    assert.equal(res.status, 403);
+  });
+
+  test("wrong password is rejected without revealing which part was wrong", async () => {
+    const res = await new Client(env.base).post("/api/login", { email: "admin@osvia.test", password: "wrong-password-1" });
+    assert.equal(res.status, 401);
+    assert.match(res.data.error, /Email or password/);
+  });
+
+  test("staff must enroll MFA before staff tools work", async () => {
+    const res = await ctx.admin.post("/api/invitations", { role: "technician", email: "new-tech@osvia.test" });
+    const fresh = new Client(env.base);
+    await fresh.post("/api/invitations/accept", { token: res.data.link.split("/#/invite/")[1], name: "New Tech", password: PASSWORD });
+    const blocked = await fresh.get("/api/dashboard");
+    assert.equal(blocked.status, 403);
+    assert.match(blocked.data.error, /two-factor/);
+    const me = await fresh.get("/api/me");
+    assert.equal(me.status, 200);
+    assert.equal(me.data.mustEnrollMfa, true);
+    await fresh.enrollMfa();
+    assert.equal((await fresh.get("/api/dashboard")).status, 200);
+  });
+
+  test("login with MFA requires a valid code", async () => {
+    const client = new Client(env.base);
+    const first = await client.post("/api/login", { email: "admin@osvia.test", password: PASSWORD });
+    assert.equal(first.data.mfaRequired, true);
+    assert.equal(client.cookie, "");
+    const bad = await client.post("/api/login/mfa", { challenge: first.data.challenge, code: "000000" === totpCode(ctx.adminSecret) ? "111111" : "000000" });
+    assert.equal(bad.status, 401);
+    const good = await client.post("/api/login/mfa", { challenge: first.data.challenge, code: totpCode(ctx.adminSecret) });
+    assert.equal(good.status, 200);
+    assert.equal((await client.get("/api/dashboard")).status, 200);
+  });
+
+  test("state-changing requests need the CSRF token and same origin", async () => {
+    const noToken = await fetch(`${env.base}/api/tickets`, { method: "POST", headers: { Cookie: ctx.custA.cookie, "Content-Type": "application/json" }, body: "{}" });
+    assert.equal(noToken.status, 403);
+    const crossSite = await ctx.custA.call("POST", "/api/tickets", { title: "x", description: "y" }, { headers: { Origin: "https://evil.example" } });
+    assert.equal(crossSite.status, 403);
+  });
+
+  test("password change keeps the current session and checks the old password", async () => {
+    const wrong = await ctx.userA.post("/api/me/password", { currentPassword: "nope-nope-nope", newPassword: "Another-Pass-77" });
+    assert.equal(wrong.status, 400);
+  });
+});
+
+describe("tenant isolation", () => {
+  let ticketA;
+  let deviceA;
+
+  before(async () => {
+    ticketA = (await ctx.custA.post("/api/tickets", { title: "Printer jam", description: "The office printer jams.", category: "printer" })).data.ticket;
+    deviceA = (await ctx.custA.post("/api/devices", { name: "Reception PC", assetTag: "A-001" })).data.device;
+  });
+
+  test("another organization cannot read records by id", async () => {
+    assert.equal((await ctx.custB.get(`/api/tickets/${ticketA.id}`)).status, 404);
+    assert.equal((await ctx.custB.get(`/api/devices/${deviceA.id}`)).status, 404);
+    assert.equal((await ctx.custB.get(`/api/organizations/${ctx.orgA}`)).status, 404);
+    assert.equal((await ctx.custB.post(`/api/tickets/${ticketA.id}/notes`, { body: "hi" })).status, 404);
+  });
+
+  test("lists only contain the caller's organization", async () => {
+    const tickets = await ctx.custB.get(`/api/tickets?organizationId=${ctx.orgA}`);
+    assert.equal(tickets.status, 200);
+    assert.ok(tickets.data.items.every((t) => t.organizationId === ctx.orgB));
+    const devices = await ctx.custB.get(`/api/devices?organizationId=${ctx.orgA}`);
+    assert.ok(devices.data.items.every((d) => d.organizationId === ctx.orgB));
+  });
+
+  test("a customer cannot create records in another organization", async () => {
+    const res = await ctx.custB.post("/api/tickets", { organizationId: ctx.orgA, title: "Sneaky", description: "Should land in Bravo" });
+    assert.equal(res.status, 201);
+    assert.equal(res.data.ticket.organizationId, ctx.orgB);
+    const device = await ctx.custB.post("/api/tickets", { title: "Wrong device", description: "x", deviceId: deviceA.id });
+    assert.equal(device.status, 400);
+  });
+
+  test("customer users only see their own tickets", async () => {
+    await ctx.userA.post("/api/tickets", { title: "My laptop", description: "Slow" });
+    const list = await ctx.userA.get("/api/tickets");
+    assert.ok(list.data.items.length >= 1);
+    assert.ok(list.data.items.every((t) => t.title === "My laptop"));
+    assert.equal((await ctx.userA.get(`/api/tickets/${ticketA.id}`)).status, 404);
+  });
+
+  test("customers cannot use staff-only endpoints", async () => {
+    assert.equal((await ctx.custA.patch(`/api/tickets/${ticketA.id}`, { status: "resolved" })).status, 403);
+    assert.equal((await ctx.custA.post("/api/monitors", { organizationId: ctx.orgA, name: "x", type: "ping", target: "8.8.8.8" })).status, 403);
+    assert.equal((await ctx.custA.patch(`/api/devices/${deviceA.id}`, { address: "10.0.0.5" })).status, 403);
+    assert.equal((await ctx.custA.post("/api/invoices", { organizationId: ctx.orgA, amount: 1000 })).status, 403);
+    assert.equal((await ctx.userA.get("/api/invoices")).status, 403);
+    assert.equal((await ctx.custA.get("/api/settings")).status, 403);
+    assert.equal((await ctx.custA.get("/api/system")).status, 403);
+  });
+
+  test("the customer audit view is limited to the organization", async () => {
+    const res = await ctx.custA.get(`/api/audit?organizationId=${ctx.orgB}`);
+    assert.equal(res.status, 200);
+    assert.ok(res.data.items.every((a) => a.organizationId === ctx.orgA));
+  });
+
+  test("technicians cannot grant themselves other technicians' tickets", async () => {
+    const other = await ctx.invite("technician", "tech2@osvia.test");
+    await other.enrollMfa();
+    const me = await other.get("/api/me");
+    const res = await ctx.tech.patch(`/api/tickets/${ticketA.id}`, { assignedTo: me.data.user.id });
+    assert.equal(res.status, 403);
+  });
+});
+
+describe("ticket lifecycle", () => {
+  test("moves through the full workflow with SLA pause and reopen", async () => {
+    const created = await ctx.custA.post("/api/tickets", { title: "Email down", description: "Outlook will not send", priority: "high", category: "email" });
+    assert.equal(created.status, 201);
+    const ticket = created.data.ticket;
+    assert.match(ticket.number, /^OBC-\d{6}$/);
+    assert.equal(ticket.status, "new");
+
+    const techMe = (await ctx.tech.get("/api/me")).data.user;
+    let res = await ctx.tech.patch(`/api/tickets/${ticket.id}`, { assignedTo: techMe.id });
+    assert.equal(res.data.ticket.status, "open");
+    assert.equal(res.data.ticket.assignedTo, techMe.id);
+
+    assert.equal((await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "closed" })).status, 400);
+
+    res = await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "in_progress" });
+    assert.ok(res.data.ticket.firstResponseAt);
+
+    res = await ctx.tech.post(`/api/tickets/${ticket.id}/notes`, { kind: "note", body: "Internal: check the mail relay" });
+    assert.equal(res.status, 201);
+    assert.equal((await ctx.tech.post(`/api/tickets/${ticket.id}/notes`, { kind: "work_log", body: "Checked relay" })).status, 400);
+    res = await ctx.tech.post(`/api/tickets/${ticket.id}/notes`, { kind: "work_log", body: "Checked relay", minutesSpent: 25 });
+    assert.equal(res.data.ticket.minutesLogged, 25);
+
+    const customerView = await ctx.custA.get(`/api/tickets/${ticket.id}`);
+    assert.ok(customerView.data.notes.every((n) => n.visibility === "customer"));
+    assert.equal(customerView.data.ticket.minutesLogged, undefined);
+
+    res = await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "pending_customer" });
+    assert.equal(res.data.ticket.status, "pending_customer");
+
+    res = await ctx.custA.post(`/api/tickets/${ticket.id}/notes`, { body: "Here is the error message." });
+    assert.equal(res.data.ticket.status, "open");
+    assert.equal(res.data.ticket.slaPaused, false);
+
+    assert.equal((await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "resolved" })).status, 400);
+    res = await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "resolved", resolutionSummary: "Reset the SMTP password." });
+    assert.equal(res.data.ticket.status, "resolved");
+
+    res = await ctx.custA.post(`/api/tickets/${ticket.id}/reopen`);
+    assert.equal(res.data.ticket.status, "open");
+    assert.equal(res.data.ticket.reopenedCount, 1);
+
+    await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "resolved" });
+    res = await ctx.custA.post(`/api/tickets/${ticket.id}/close`);
+    assert.equal(res.data.ticket.status, "closed");
+    assert.equal((await ctx.custA.post(`/api/tickets/${ticket.id}/notes`, { body: "One more thing" })).status, 400);
+    assert.equal((await ctx.tech.patch(`/api/tickets/${ticket.id}`, { status: "open" })).status, 403);
+
+    const detail = await ctx.admin.get(`/api/tickets/${ticket.id}`);
+    const statuses = detail.data.events.map((e) => e.toStatus);
+    assert.deepEqual(statuses.filter((s, i) => s !== statuses[i - 1]), ["new", "open", "in_progress", "pending_customer", "open", "resolved", "open", "resolved", "closed"]);
+  });
+});
+
+describe("attachments", () => {
+  let ticket;
+  before(async () => {
+    ticket = (await ctx.custA.post("/api/tickets", { title: "Screen", description: "Screenshot attached" })).data.ticket;
+  });
+
+  async function upload(client, body, type, extra = {}) {
+    return client.call("POST", `/api/tickets/${ticket.id}/attachments`, undefined, { rawBody: body, headers: { "Content-Type": type, "X-File-Name": "shot.png", ...extra } });
   }
 
-  return {
-    db,
-    dir,
-    client,
-    async stop() {
-      await new Promise((resolve) => server.close(resolve));
-      db.close();
-    },
-  };
-}
-
-test("administrator setup, login, and rejected second setup", async () => {
-  const app = await start();
-  const admin = app.client();
-  const health = await admin.call("GET", "/api/health");
-  assert.equal(health.data.needsSetup, true);
-  assert.equal(health.data.remoteManagement, "not_connected");
-
-  const created = await admin.call("POST", "/api/setup", {
-    name: "Osbert Admin",
-    email: "admin@osvia.test",
-    password: "correct horse battery",
+  test("accepts images and rejects executables by content", async () => {
+    const ok = await upload(ctx.custA, PNG, "image/png");
+    assert.equal(ok.status, 201);
+    assert.equal(ok.data.attachments.length, 1);
+    const exe = await upload(ctx.custA, Buffer.from("MZ\x90\x00 this is not an image"), "image/png");
+    assert.equal(exe.status, 415);
+    const tooBig = await upload(ctx.custA, Buffer.alloc(5 * 1024 * 1024 + 10, 1), "image/png");
+    assert.equal(tooBig.status, 413);
   });
-  assert.equal(created.status, 200);
-  assert.equal(created.data.user.role, "admin");
-  assert.equal(await (await admin.call("GET", "/api/me")).data.user.email, "admin@osvia.test");
 
-  const again = await app.client().call("POST", "/api/setup", {
-    name: "Other",
-    email: "other@osvia.test",
-    password: "correct horse battery",
+  test("downloads are authorized and internal files stay internal", async () => {
+    const internal = await upload(ctx.admin, PNG, "image/png", { "X-Visibility": "internal" });
+    const files = internal.data.attachments;
+    const customerFile = files.find((f) => f.visibility === "customer");
+    const internalFile = files.find((f) => f.visibility === "internal");
+    const download = await ctx.custA.raw("GET", `/api/attachments/${customerFile.id}`);
+    assert.equal(download.status, 200);
+    assert.equal(download.headers.get("content-type"), "image/png");
+    assert.match(download.headers.get("content-disposition"), /attachment/);
+    assert.equal((await ctx.custB.raw("GET", `/api/attachments/${customerFile.id}`)).status, 404);
+    assert.equal((await ctx.custA.raw("GET", `/api/attachments/${internalFile.id}`)).status, 404);
+    const view = await ctx.custA.get(`/api/tickets/${ticket.id}`);
+    assert.ok(view.data.attachments.every((f) => f.visibility === "customer"));
   });
-  assert.equal(again.status, 403);
-
-  const bad = await app.client().call("POST", "/api/login", { email: "admin@osvia.test", password: "wrong-password" });
-  assert.equal(bad.status, 401);
-  const me = await app.client().call("GET", "/api/me");
-  assert.equal(me.status, 401);
-  await app.stop();
 });
 
-test("customers are isolated and tickets move from open to resolved", async () => {
-  const app = await start();
-  const admin = app.client();
-  await admin.call("POST", "/api/setup", { name: "Admin", email: "admin@osvia.test", password: "correct horse battery" });
-  const tech = await admin.call("POST", "/api/users", {
-    name: "Tech A",
-    email: "tech@osvia.test",
-    password: "correct horse battery",
-    role: "technician",
-  });
-  assert.equal(tech.status, 201);
+describe("billing", () => {
+  test("payments stay pending until an administrator verifies them", async () => {
+    const plans = (await ctx.custA.get("/api/plans")).data.items;
+    const business = plans.find((p) => p.name === "Business");
+    const invoice = (await ctx.admin.post("/api/invoices", { organizationId: ctx.orgA, planId: business.id })).data.invoice;
+    assert.match(invoice.number, /^INV-\d{4}-0001$/);
+    assert.equal(invoice.amount, business.price);
+    const second = (await ctx.admin.post("/api/invoices", { organizationId: ctx.orgB, amount: 5000, description: "Call-out" })).data.invoice;
+    assert.match(second.number, /-0002$/);
 
-  const first = await admin.call("POST", "/api/organizations", {
-    name: "Kampala Books",
-    contactName: "Amina",
-    contactEmail: "amina@books.test",
-    contactPhone: "0700000001",
-    location: "Kampala",
-  });
-  const second = await admin.call("POST", "/api/organizations", {
-    name: "Jinja School",
-    contactName: "Peter",
-    contactEmail: "peter@school.test",
-    location: "Jinja",
-  });
-  await admin.call("POST", "/api/users", {
-    name: "Amina",
-    email: "amina@books.test",
-    password: "customer-password",
-    role: "customer",
-    organizationId: first.data.organization.id,
-  });
-  await admin.call("POST", "/api/users", {
-    name: "Peter",
-    email: "peter@school.test",
-    password: "customer-password",
-    role: "customer",
-    organizationId: second.data.organization.id,
+    assert.equal((await ctx.admin.post(`/api/organizations/${ctx.orgA}/subscription`, { status: "active" })).status, 400);
+
+    const recorded = await ctx.custA.post("/api/payments", { invoiceId: invoice.id, amount: business.price, method: "mobile_money_manual", reference: "MM-123456" });
+    assert.equal(recorded.status, 201);
+    assert.equal(recorded.data.payment.status, "pending");
+    assert.equal((await ctx.custA.post("/api/payments", { invoiceId: invoice.id, amount: 1, method: "mobile_money_manual", reference: "MM-123456" })).status, 409);
+
+    let summary = (await ctx.custA.get("/api/billing/summary")).data;
+    assert.equal(summary.subscriptionStatus, "unpaid");
+    assert.equal(summary.pendingPayments, 1);
+
+    const paymentId = recorded.data.payment.id;
+    assert.equal((await ctx.custA.post(`/api/payments/${paymentId}/verify`, { confirmReceived: true, reconciliationNote: "x" })).status, 403);
+    assert.equal((await ctx.admin.post(`/api/payments/${paymentId}/verify`, { reconciliationNote: "x" })).status, 400);
+    assert.equal((await ctx.custA.raw("GET", `/api/payments/${paymentId}/receipt`)).status, 400);
+
+    const verified = await ctx.admin.post(`/api/payments/${paymentId}/verify`, { confirmReceived: true, reconciliationNote: "Matched MTN statement line 14" });
+    assert.equal(verified.data.payment.status, "verified");
+    assert.equal((await ctx.admin.post(`/api/payments/${paymentId}/reject`, { reason: "oops" })).status, 400);
+
+    summary = (await ctx.custA.get("/api/billing/summary")).data;
+    assert.equal(summary.subscriptionStatus, "active");
+    assert.equal(summary.renewalDate, invoice.periodEnd);
+    assert.equal(summary.outstanding, 0);
+    const paid = (await ctx.custA.get(`/api/invoices/${invoice.id}`)).data.invoice;
+    assert.equal(paid.status, "paid");
+
+    const receipt = await ctx.custA.raw("GET", `/api/payments/${paymentId}/receipt`);
+    assert.equal(receipt.status, 200);
+    assert.equal(receipt.headers.get("content-type"), "application/pdf");
+    assert.equal((await ctx.custB.raw("GET", `/api/invoices/${invoice.id}/pdf`)).status, 404);
+    assert.equal((await ctx.admin.post(`/api/invoices/${invoice.id}/void`, { reason: "test" })).status, 400);
   });
 
-  const amina = app.client();
-  const login = await amina.call("POST", "/api/login", { email: "amina@books.test", password: "customer-password" });
-  assert.equal(login.status, 200);
-  const orgs = await amina.call("GET", "/api/organizations");
-  assert.equal(orgs.data.total, 1);
-  assert.equal(orgs.data.items[0].name, "Kampala Books");
-
-  const ticket = await amina.call("POST", "/api/tickets", {
-    title: "Printer is jammed",
-    description: "The front desk printer stopped feeding paper.",
-    priority: "high",
-    organizationId: second.data.organization.id,
+  test("a rejected payment never activates anything", async () => {
+    const invoice = (await ctx.admin.post("/api/invoices", { organizationId: ctx.orgB, amount: 20000 })).data.invoice;
+    const pay = (await ctx.custB.post("/api/payments", { invoiceId: invoice.id, amount: 20000, method: "bank_transfer", reference: "BT-1" })).data.payment;
+    const rejected = await ctx.admin.post(`/api/payments/${pay.id}/reject`, { reason: "Not on statement" });
+    assert.equal(rejected.data.payment.status, "rejected");
+    assert.equal((await ctx.custB.get("/api/billing/summary")).data.subscriptionStatus, "unpaid");
   });
-  assert.equal(ticket.status, 201);
-  assert.equal(ticket.data.ticket.organizationId, first.data.organization.id);
-
-  const peter = app.client();
-  await peter.call("POST", "/api/login", { email: "peter@school.test", password: "customer-password" });
-  const hidden = await peter.call("GET", `/api/tickets/${ticket.data.ticket.id}`);
-  assert.equal(hidden.status, 404);
-  const peterDevices = await peter.call("GET", "/api/devices");
-  assert.equal(peterDevices.data.total, 0);
-
-  const technician = app.client();
-  await technician.call("POST", "/api/login", { email: "tech@osvia.test", password: "correct horse battery" });
-  const internal = await technician.call("POST", `/api/tickets/${ticket.data.ticket.id}/notes`, {
-    body: "Checked the roller. Ordering a spare.",
-    visibility: "internal",
-    kind: "work_log",
-  });
-  assert.equal(internal.status, 201);
-  const resolved = await technician.call("PATCH", `/api/tickets/${ticket.data.ticket.id}`, {
-    status: "resolved",
-    assignedTo: tech.data.user.id,
-    resolutionSummary: "Replaced the pickup roller and printed a test page.",
-  });
-  assert.equal(resolved.status, 200);
-  assert.equal(resolved.data.ticket.status, "resolved");
-
-  const visible = await amina.call("GET", `/api/tickets/${ticket.data.ticket.id}`);
-  assert.equal(visible.data.ticket.resolutionSummary, "Replaced the pickup roller and printed a test page.");
-  assert.equal(visible.data.notes.length, 0);
-
-  const plans = await amina.call("PATCH", "/api/plans/1", { priceUgx: 1 });
-  assert.equal(plans.status, 403);
-  const backup = await amina.call("POST", "/api/admin/backup", {});
-  assert.equal(backup.status, 403);
-  await app.stop();
 });
 
-test("subscription stays unpaid until an administrator confirms payment and activates it", async () => {
-  const app = await start();
-  const admin = app.client();
-  await admin.call("POST", "/api/setup", { name: "Admin", email: "admin@osvia.test", password: "correct horse battery" });
-  const org = await admin.call("POST", "/api/organizations", {
-    name: "Market Stall",
-    contactName: "Grace",
-    contactEmail: "grace@market.test",
+describe("reports", () => {
+  test("permissions and scoping", async () => {
+    assert.equal((await ctx.userA.get("/api/reports/summary")).status, 403);
+    const scoped = await ctx.custA.get(`/api/reports/summary?organizationId=${ctx.orgB}`);
+    assert.equal(scoped.status, 200);
+    assert.equal(scoped.data.organization, "Alpha");
+    assert.equal(scoped.data.technicians, undefined);
+    const staff = await ctx.admin.get("/api/reports/summary");
+    assert.ok(Array.isArray(staff.data.technicians));
+    assert.ok(staff.data.tickets.created >= 3);
   });
-  const early = await admin.call("POST", `/api/organizations/${org.data.organization.id}/subscription`, { planId: 1 });
-  assert.equal(early.status, 400);
 
-  const payment = await admin.call("POST", "/api/payments", {
-    organizationId: org.data.organization.id,
-    amountUgx: 20000,
-    method: "cash",
-    reference: "receipt-100",
+  test("PDF and CSV exports", async () => {
+    const pdf = await ctx.custA.raw("GET", "/api/reports/summary.pdf");
+    assert.equal(pdf.status, 200);
+    assert.equal(pdf.headers.get("content-type"), "application/pdf");
+    assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0, 5).toString(), "%PDF-");
+    const csv = await ctx.custA.raw("GET", "/api/reports/tickets.csv");
+    const bytes = Buffer.from(await csv.arrayBuffer());
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+    const text = bytes.toString("utf8");
+    assert.match(text, /^\uFEFFNumber,Organization/);
+    assert.ok(!text.includes("Bravo"));
   });
-  assert.equal(payment.data.payment.status, "recorded");
-  const stillBlocked = await admin.call("POST", `/api/organizations/${org.data.organization.id}/subscription`, { planId: 1 });
-  assert.equal(stillBlocked.status, 400);
-
-  const confirmed = await admin.call("POST", `/api/payments/${payment.data.payment.id}/confirm`, {});
-  assert.equal(confirmed.data.payment.status, "confirmed");
-  const orgAfterPay = await admin.call("GET", `/api/organizations/${org.data.organization.id}`);
-  assert.equal(orgAfterPay.data.organization.subscriptionStatus, "unpaid");
-
-  const active = await admin.call("POST", `/api/organizations/${org.data.organization.id}/subscription`, { planId: 1 });
-  assert.equal(active.status, 200);
-  assert.equal(active.data.organization.subscriptionStatus, "active");
-  assert.equal(active.data.organization.planName, "Starter");
-  assert.ok(active.data.organization.renewalDate);
-
-  await admin.call("POST", "/api/users", {
-    name: "Tech",
-    email: "tech2@osvia.test",
-    password: "correct horse battery",
-    role: "technician",
-  });
-  const technician = app.client();
-  await technician.call("POST", "/api/login", { email: "tech2@osvia.test", password: "correct horse battery" });
-  const denied = await technician.call("POST", `/api/organizations/${org.data.organization.id}/subscription`, { planId: 1 });
-  assert.equal(denied.status, 403);
-  await app.stop();
 });
 
-test("device records do not claim an online state and reports use stored rows", async () => {
-  const app = await start();
-  const admin = app.client();
-  await admin.call("POST", "/api/setup", { name: "Admin", email: "admin@osvia.test", password: "correct horse battery" });
-  const org = await admin.call("POST", "/api/organizations", {
-    name: "Clinic",
-    contactName: "Nurse",
-    contactEmail: "desk@clinic.test",
+describe("organization suspension", () => {
+  test("suspension blocks sign-in and reactivation restores it", async () => {
+    const client = new Client(env.base);
+    assert.equal((await client.login("user@alpha.test")).status, 200);
+    assert.equal((await ctx.admin.post(`/api/organizations/${ctx.orgA}/suspend`, { reason: "Unpaid" })).status, 200);
+    assert.equal((await client.get("/api/me")).status, 401);
+    const blocked = await new Client(env.base).login("user@alpha.test");
+    assert.equal(blocked.status, 403);
+    assert.equal((await ctx.admin.post(`/api/organizations/${ctx.orgA}/reactivate`)).status, 200);
+    const again = new Client(env.base);
+    assert.equal((await again.login("user@alpha.test")).status, 200);
+    ctx.userA = again;
+    ctx.custA = new Client(env.base);
+    await ctx.custA.login("admin@alpha.test");
   });
-  const device = await admin.call("POST", "/api/devices", {
-    organizationId: org.data.organization.id,
-    name: "Reception PC",
-    operatingSystem: "Windows 11",
-    lastConnection: new Date().toISOString(),
-    managementStatus: "online",
+
+  test("pending organizations can sign in but not open tickets", async () => {
+    const client = new Client(env.base);
+    const reg = await client.post("/api/register", { organizationName: "Charlie", contactName: "C", email: "c@charlie.test", password: PASSWORD });
+    assert.equal(reg.status, 201);
+    await client.login("c@charlie.test");
+    const res = await client.post("/api/tickets", { title: "Help", description: "Help" });
+    assert.equal(res.status, 403);
+    assert.match(res.data.error, /reviewing/);
   });
-  assert.equal(device.status, 201);
-  assert.equal(device.data.device.lastConnection, null);
-  assert.equal(device.data.device.reachability, "unknown");
-  assert.equal(device.data.device.managementStatus, "not_connected");
-
-  const consent = await admin.call("POST", `/api/devices/${device.data.device.id}/consent`, {});
-  assert.equal(consent.data.managementStatus, "consent_recorded");
-  assert.equal(consent.data.lastConnection, null);
-
-  const record = await admin.call("POST", "/api/maintenance", {
-    organizationId: org.data.organization.id,
-    deviceId: device.data.device.id,
-    summary: "Cleaned dust and updated Windows.",
-    performedAt: "2026-10-01",
-  });
-  assert.equal(record.status, 201);
-  const report = await admin.call("GET", `/api/maintenance?organizationId=${org.data.organization.id}`);
-  assert.equal(report.data.records.length, 1);
-  assert.equal(report.data.records[0].summary, "Cleaned dust and updated Windows.");
-
-  const pdf = await admin.call("GET", `/api/reports/maintenance.pdf?organizationId=${org.data.organization.id}`);
-  assert.equal(pdf.status, 200);
-  assert.match(pdf.type, /application\/pdf/);
-  assert.ok(pdf.text.startsWith("%PDF"));
-  await app.stop();
 });
 
-test("a device address check reports online and offline from a real connection", async () => {
-  const listener = net.createServer((socket) => socket.end());
-  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
-  const port = listener.address().port;
-  const app = await start();
-  try {
-    const admin = app.client();
-    await admin.call("POST", "/api/setup", { name: "Admin", email: "admin@osvia.test", password: "correct horse battery" });
-    const org = await admin.call("POST", "/api/organizations", {
-      name: "Shop",
-      contactName: "Ada",
-      contactEmail: "ada@shop.test",
-    });
-    const online = await admin.call("POST", "/api/devices", {
-      organizationId: org.data.organization.id,
-      name: "Counter PC",
-      address: "127.0.0.1",
-      checkPort: port,
-      managementStatus: "online",
-    });
-    assert.equal(online.status, 201);
-    assert.equal(online.data.device.reachability, "online");
-    assert.ok(online.data.device.lastConnection);
-
-    await new Promise((resolve) => listener.close(resolve));
-    const offline = await admin.call("POST", `/api/devices/${online.data.device.id}/check`, {});
-    assert.equal(offline.status, 200);
-    assert.equal(offline.data.device.reachability, "offline");
-
-    const dashboard = await admin.call("GET", "/api/dashboard");
-    assert.equal(dashboard.data.onlineDevices, 0);
-    assert.equal(dashboard.data.offlineDevices, 1);
-  } finally {
-    await app.stop();
-    if (listener.listening) await new Promise((resolve) => listener.close(resolve));
-  }
-});
-
-test("missing CSRF token is rejected and a backup can be opened", async () => {
-  const app = await start();
-  const admin = app.client();
-  await admin.call("POST", "/api/setup", { name: "Admin", email: "admin@osvia.test", password: "correct horse battery" });
-  const org = await admin.call("POST", "/api/organizations", {
-    name: "Backup Co",
-    contactName: "Rita",
-    contactEmail: "rita@backup.test",
+describe("remote support", () => {
+  test("requires a linked agent, customer consent and MFA, and is recorded", async () => {
+    const device = (await ctx.custA.post("/api/devices", { name: "Accounts PC" })).data.device;
+    let res = await ctx.tech.post(`/api/devices/${device.id}/remote`, { reason: "Ticket follow-up" });
+    assert.equal(res.status, 400);
+    env.db.prepare("UPDATE devices SET mesh_node_id = 'node//abc$def' WHERE id = ?").run(device.id);
+    res = await ctx.tech.post(`/api/devices/${device.id}/remote`, { reason: "Ticket follow-up" });
+    assert.equal(res.status, 403);
+    assert.match(res.data.error, /consent/);
+    assert.equal((await ctx.custA.post(`/api/devices/${device.id}/consent`, { confirm: true })).status, 200);
+    process.env.MESHCENTRAL_URL = "https://mesh.example.test";
+    try {
+      assert.equal((await ctx.tech.post(`/api/devices/${device.id}/remote`, {})).status, 400);
+      res = await ctx.tech.post(`/api/devices/${device.id}/remote`, { reason: "Install printer driver", mode: "desktop" });
+      assert.equal(res.status, 200);
+      assert.equal(res.data.url, "https://mesh.example.test/?gotonode=abc%24def&viewmode=11");
+    } finally {
+      delete process.env.MESHCENTRAL_URL;
+    }
+    const detail = await ctx.custA.get(`/api/devices/${device.id}`);
+    assert.equal(detail.data.remoteSessions.length, 1);
+    assert.equal(detail.data.device.meshNodeId, undefined);
+    const notes = await ctx.custA.get("/api/notifications");
+    assert.ok(notes.data.items.some((n) => n.kind === "remote"));
   });
-  admin.jar.delete("csrf");
-  const blocked = await admin.call("POST", "/api/organizations", {
-    name: "Should fail",
-    contactName: "Nope",
-    contactEmail: "nope@backup.test",
-  });
-  assert.equal(blocked.status, 403);
-
-  const file = backupDatabase(app.db, path.join(app.dir, "backups"));
-  const copy = new DatabaseSync(file, { readOnly: true });
-  const row = copy.prepare("SELECT name FROM organizations WHERE name = ?").get("Backup Co");
-  assert.equal(row.name, "Backup Co");
-  copy.close();
-  assert.equal(org.status, 201);
-  await app.stop();
-});
-
-test("data remains after the database connection is reopened", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "osvia-restart-"));
-  const file = path.join(dir, "app.sqlite");
-  const first = openDatabase(file);
-  first.prepare("INSERT INTO users (name, email, password_hash, role, active, created_at) VALUES (?, ?, ?, 'admin', 1, ?)").run(
-    "Admin",
-    "admin@osvia.test",
-    "stored-hash",
-    new Date().toISOString(),
-  );
-  first.close();
-  const second = openDatabase(file);
-  const row = second.prepare("SELECT email FROM users WHERE email = ?").get("admin@osvia.test");
-  assert.equal(row.email, "admin@osvia.test");
-  second.close();
-});
-
-test("a passed renewal date becomes past due without marking a new payment", async () => {
-  const app = await start();
-  const admin = app.client();
-  await admin.call("POST", "/api/setup", { name: "Admin", email: "admin@osvia.test", password: "correct horse battery" });
-  const org = await admin.call("POST", "/api/organizations", {
-    name: "Due Org",
-    contactName: "Sam",
-    contactEmail: "sam@due.test",
-  });
-  await admin.call("POST", "/api/users", {
-    name: "Sam",
-    email: "sam@due.test",
-    password: "customer-password",
-    role: "customer",
-    organizationId: org.data.organization.id,
-  });
-  app.db.prepare("UPDATE organizations SET subscription_status = 'active', renewal_date = '2020-01-01' WHERE id = ?").run(org.data.organization.id);
-  runReminders(app.db, new Date("2026-10-10T00:00:00.000Z"));
-  const updated = app.db.prepare("SELECT subscription_status FROM organizations WHERE id = ?").get(org.data.organization.id);
-  assert.equal(updated.subscription_status, "past_due");
-  const note = app.db.prepare("SELECT title FROM notifications WHERE title LIKE 'Renewal date%' LIMIT 1").get();
-  assert.ok(note);
-  const payments = app.db.prepare("SELECT COUNT(*) AS n FROM payments").get();
-  assert.equal(payments.n, 0);
-  await app.stop();
 });

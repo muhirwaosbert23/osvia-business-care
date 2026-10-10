@@ -1,60 +1,59 @@
 # OSVIA Business Care
 
-Local support portal for OSVIA Technologies, Kampala. It runs on this Windows PC with Node.js and a SQLite file. Docker and MeshCentral are not part of this setup.
+Managed IT support portal for OSVIA TECHNOLOGIES, Kampala ([osviatech.com](https://osviatech.com)): helpdesk with SLA, device and asset register, preventive maintenance, service monitoring and incidents, billing in UGX with manual payment verification, reports, and optional MeshCentral remote support with customer consent.
 
 ## Technologies
 
-- Node.js 22 or newer (this PC has Node 24)
-- Built-in `node:sqlite` for organizations, users, tickets, devices, plans, payments, and audit events
-- Browser pages served by the same Node process
-- Passwords stored with scrypt
-- Session cookies marked HttpOnly
+- Node.js 22.13+ (tested on Node 24) with the built-in `node:sqlite` database, no build step
+- Plain ES modules in the browser, strict Content-Security-Policy, light and dark themes
+- `nodemailer` for SMTP email (the only dependency)
+- Optional: MeshCentral through its official `meshctrl.js` tool, Docker Compose
 
-## Start
-
-```bat
-node --experimental-sqlite server\index.js
-```
-
-Or double-click `start.cmd`.
-
-Open http://127.0.0.1:3080
-
-The first page creates the administrator. There is no default password. After that, staff can add organizations, and a customer can register from the sign-in page.
-
-Copy `.env.example` to `.env` to change the port or add a public contact email and phone.
-
-## Tests
+## Quick start (Windows)
 
 ```bat
-npm test
+npm ci --omit=dev
+copy .env.example .env
+npm start
 ```
 
-## What works locally
+Or double-click `start.cmd`. Open http://127.0.0.1:3080. The first visit creates the administrator (no default password) and then asks for two-factor authentication.
 
-- Administrator setup, sign-in, and organization registration
-- Customer accounts see only their own organization, devices, tickets, and payments
-- Tickets can be assigned, noted, and resolved
-- Device inventory with consent. Enter an IP address or hostname and the portal pings it, or connects to a port you choose, then shows Online or Offline. Devices without an address stay not checked.
-- Service plans in UGX, manual payment records, and administrator activation
-- Maintenance records and a PDF built from those stored rows
-- In-app notifications and renewal reminders
-- Audit log
-- SQLite backup through `VACUUM INTO`
-- Restarting the process keeps the database file in `data\osvia.sqlite`
+## Roles
 
-## What is not running
+| Role | Can do |
+| --- | --- |
+| Administrator (OSVIA) | Everything: organizations, staff, plans, invoices, payment verification, settings, backups |
+| Technician (OSVIA) | Tickets assigned to them or unassigned, devices, maintenance, monitoring, incidents, remote support |
+| Customer administrator | Their organization's tickets, devices, users, billing, reports and remote-support consent |
+| Customer user | Their own tickets and devices assigned to them |
 
-- MeshCentral, remote desktop, and device agents
-- Email. Notifications stay inside the portal until SMTP is configured
-- Mobile-money collection. A payment is only a record until an administrator confirms it
-- HTTPS. The server listens on `127.0.0.1`
-- Docker, the Kali server, and the existing Ontike or Uptime Kuma apps
+Every rule is enforced by the server, not just hidden in the page.
 
-## Backup
+## Commands
 
-1. Sign in as the administrator and keep a copy from `data\backups`, or stop the server and copy `data\osvia.sqlite`.
-2. To restore, stop the server, replace `data\osvia.sqlite` with that copy, and start the server again.
-3. Sign in and confirm the organization you expect is present.
+| Command | Purpose |
+| --- | --- |
+| `npm start` | Run the portal |
+| `npm test` | Automated tests (in-memory database, fake SMTP and fake meshctrl) |
+| `npm run backup` | Write a backup to `data/backups` |
+| `npm run restore -- <file>` | Restore a backup (stop the portal first) |
+| `npm run migrate:check -- <db file>` | Migrate a copy of a database and compare row counts |
+| `npm run loadtest` | Measure throughput against a throwaway portal on port 3099 |
 
-Do not commit `data\` or `.env`.
+## Documentation
+
+- [Deployment and Docker](docs/DEPLOYMENT.md)
+- [MeshCentral](docs/MESHCENTRAL.md)
+- [Backup and restore](docs/BACKUP.md)
+- [Security](docs/SECURITY.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Upgrade report](docs/UPGRADE-REPORT.md)
+
+## Not included
+
+- No mobile-money or card API. Payments are recorded as pending and an administrator verifies them against the OSVIA statement.
+- MeshCentral has only been tested with a fake `meshctrl`; see `docs/MESHCENTRAL.md` before using it live.
+- The Docker files have not been built on this PC.
+
+Never commit `.env` or `data/`.
