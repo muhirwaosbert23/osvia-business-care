@@ -1,0 +1,14 @@
+{
+  "name": "osvia-business-care",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OSVIA Business Care local support portal",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --experimental-sqlite server/index.js",
+    "test": "node --experimental-sqlite --test test/workflows.test.js"
+  }
+}
