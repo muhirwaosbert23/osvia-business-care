@@ -2,6 +2,7 @@ import {
   api, badge, button, card, CATEGORIES, clear, dataTable, definitionList, download, empty, enumOptions, errorBox, fmtDate, fmtDateTime, fmtRelative,
   formDialog, h, icon, IMPACTS, isRole, isStaff, label, orgOptions, pageHeader, PRIORITIES, skeleton, staffOptions, stat, state, toast,
 } from "./core.js";
+import { securitySetupPage, staffDashboard } from "./pages-dashboard.js";
 
 const STAFF_TRANSITIONS = {
   new: ["open", "in_progress", "pending_customer", "resolved"],
@@ -12,13 +13,6 @@ const STAFF_TRANSITIONS = {
   closed: ["open"],
 };
 
-function healthList(health) {
-  const names = { meshcentral: "MeshCentral", smtp: "Email (SMTP)", monitor_runner: "Monitoring checks", scheduler: "Background jobs", backup: "Backups" };
-  return h("ul", { class: "health-list" }, Object.entries(health).map(([name, item]) => h("li", {},
-    h("div", {}, h("strong", {}, names[name] || label(name)), h("small", { class: "muted" }, item.detail || "")),
-    h("div", { class: "right" }, badge(item.status), item.checkedAt ? h("small", { class: "muted" }, fmtRelative(item.checkedAt)) : null))));
-}
-
 function ticketMiniTable(items) {
   if (!items.length) return empty("No open tickets", "New requests appear here.");
   return h("ul", { class: "mini-list" }, items.map((t) => h("li", {}, h("a", { href: `#/tickets/${t.id}` },
@@ -27,6 +21,10 @@ function ticketMiniTable(items) {
 }
 
 export async function dashboardPage(main) {
+  if (isStaff() && state.mustEnrollMfa) {
+    securitySetupPage(main);
+    return;
+  }
   clear(main, pageHeader("Dashboard"), skeleton(6));
   let d;
   try {
@@ -37,27 +35,7 @@ export async function dashboardPage(main) {
   }
   const actions = [button("New ticket", () => newTicketDialog(), { kind: "primary", iconName: "plus" })];
   if (isStaff()) {
-    const admin = state.me.role === "admin";
-    const grid = h("div", { class: "stats" },
-      stat("Open tickets", d.tickets.open, { href: "#/tickets" }),
-      stat("Unassigned", d.tickets.unassigned, { tone: d.tickets.unassigned ? "warn" : "", href: "#/tickets?assigned=none" }),
-      stat("Assigned to me", d.tickets.mine, { href: "#/tickets?assigned=me" }),
-      stat("SLA breached", d.tickets.breached, { tone: d.tickets.breached ? "bad" : "ok", href: "#/tickets?breached=1" }),
-      stat("Response due in 2 h", d.tickets.dueSoon, { tone: d.tickets.dueSoon ? "warn" : "" }),
-      stat("Urgent open", d.tickets.urgent, { tone: d.tickets.urgent ? "bad" : "" }),
-      stat("Devices online", `${d.devices.online || 0} / ${d.devices.total || 0}`, { hint: `${d.devices.offline || 0} offline · ${d.devices.unknown || 0} not checked`, href: "#/devices" }),
-      stat("Open incidents", d.incidentsOpen, { tone: d.incidentsOpen ? "bad" : "ok", href: "#/incidents" }),
-      stat("Monitors down", d.monitors.down, { tone: d.monitors.down ? "bad" : "", hint: `${d.monitors.stale} stale · ${d.monitors.total} total`, href: "#/monitoring" }),
-      stat("Maintenance overdue", d.maintenanceOverdue, { tone: d.maintenanceOverdue ? "warn" : "", hint: `${d.maintenanceDueWeek} due this week`, href: "#/maintenance" }),
-      admin ? stat("Organizations awaiting approval", d.organizationsPending, { tone: d.organizationsPending ? "warn" : "", href: "#/organizations?status=pending" }) : null,
-      admin ? stat("Payments to verify", d.paymentsPending, { tone: d.paymentsPending ? "warn" : "", href: "#/billing" }) : null,
-      admin ? stat("Overdue invoices", d.invoicesOverdue, { tone: d.invoicesOverdue ? "bad" : "", href: "#/billing" }) : null,
-      admin ? stat("Renewals in 14 days", d.renewalsDue) : null,
-      admin && d.emailFailed ? stat("Emails failed", d.emailFailed, { tone: "bad", href: "#/settings" }) : null,
-    );
-    clear(main, pageHeader(`Good ${greeting()}, ${state.me.name.split(" ")[0]}`, admin ? "Operations overview for OSVIA Business Care." : "Your queue and the systems you look after.", actions),
-      grid,
-      h("div", { class: "grid-2" }, card("Active tickets", ticketMiniTable(d.recentTickets), { actions: h("a", { href: "#/tickets", class: "link" }, "View all") }), card("Integration health", healthList(d.health))));
+    staffDashboard(main, d, actions);
     return;
   }
   const org = d.organization;
@@ -81,11 +59,6 @@ export async function dashboardPage(main) {
       card("Upcoming maintenance", d.upcomingMaintenance.length ? h("ul", { class: "mini-list" }, d.upcomingMaintenance.map((m) => h("li", {}, h("span", { class: "grow" }, m.title), h("span", { class: "muted" }, fmtDate(m.nextDue))))) : empty("Nothing scheduled"))),
     state.config.escalation ? card("Urgent problem?", h("p", {}, state.config.escalation, state.config.supportPhone ? h("strong", {}, ` Support line: ${state.config.supportPhone}`) : null), { cls: "subtle" }) : null,
   );
-}
-
-function greeting() {
-  const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: "Africa/Kampala" }).format(new Date()));
-  return hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening";
 }
 
 function slaCell(t) {

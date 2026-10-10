@@ -1,4 +1,4 @@
-import { api, button, clear, currentQuery, errorBox, h, icon, pageHeader, state, toast } from "./core.js";
+import { api, button, clear, currentQuery, errorBox, h, icon, pageHeader, state } from "./core.js";
 import { accountPage, auditPage, myOrganizationPage, notificationsPage, organizationDetailPage, organizationsPage, reportsPage, settingsPage, teamPage } from "./pages-admin.js";
 import { deviceDetailPage, devicesPage, maintenancePage } from "./pages-assets.js";
 import { invitePage, loginPage, registerPage, setupPage } from "./pages-auth.js";
@@ -91,7 +91,9 @@ function buildShell() {
   const scrim = h("div", { class: "scrim", onclick: () => document.body.classList.remove("nav-open") });
   clear(root, h("a", { href: "#main", class: "skip" }, "Skip to content"), h("div", { class: "layout" }, sidebar, scrim, h("div", { class: "content" }, topbar, main)));
   for (const item of NAV.filter((n) => n.roles.includes(state.me.role))) {
-    nav.append(h("a", { href: `#/${item.path}`, dataset: { path: item.path } }, icon(item.icon), h("span", {}, item.label)));
+    const locked = state.mustEnrollMfa && item.path !== "dashboard";
+    nav.append(h("a", { href: `#/${item.path}`, dataset: { path: item.path }, class: locked ? "locked" : null, title: locked ? "Turn on two-factor authentication to unlock" : null },
+      icon(item.icon), h("span", {}, item.label), locked ? icon("lock", "icon tiny lock-mark") : null));
   }
   shell = { main, nav, bell };
 }
@@ -153,8 +155,8 @@ async function route() {
     if (active) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   }
-  if (state.mustEnrollMfa && path !== "account" && path !== "notifications") {
-    location.hash = "#/account";
+  if (state.mustEnrollMfa && !["dashboard", "account", "notifications"].includes(path)) {
+    location.hash = "#/dashboard";
     return;
   }
   if (!match) {
@@ -193,7 +195,6 @@ async function boot() {
     state.me = me.user;
     state.org = me.organization;
     state.mustEnrollMfa = me.mustEnrollMfa;
-    if (me.mustEnrollMfa) toast("Turn on two-factor authentication to unlock staff tools.", "warn");
   } catch {
     state.me = null;
   }

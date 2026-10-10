@@ -45,6 +45,21 @@ function health(db) {
   return map;
 }
 
+function ticketTrend(db, scope, args) {
+  const days = 14;
+  const start = new Date(Date.now() + 3 * 3600000 - (days - 1) * 86400000).toISOString().slice(0, 10);
+  const count = (column) => Object.fromEntries(db.prepare(`
+    SELECT date(${column}, '+3 hours') AS day, COUNT(*) AS n FROM tickets t
+    WHERE ${column} IS NOT NULL AND date(${column}, '+3 hours') >= ? AND ${scope} GROUP BY day
+  `).all(start, ...args).map((r) => [r.day, r.n]));
+  const opened = count("t.created_at");
+  const resolved = count("t.resolved_at");
+  return Array.from({ length: days }, (_, i) => {
+    const day = new Date(Date.parse(`${start}T12:00:00Z`) + i * 86400000).toISOString().slice(0, 10);
+    return { day, opened: opened[day] || 0, resolved: resolved[day] || 0 };
+  });
+}
+
 function dashboard({ db, actor }) {
   const today = todayUtc();
   const soon = new Date(Date.now() + 2 * 3600000).toISOString();
@@ -73,6 +88,9 @@ function dashboard({ db, actor }) {
       maintenanceDueWeek: db.prepare("SELECT COUNT(*) AS n FROM maintenance_schedules WHERE active = 1 AND next_due BETWEEN ? AND date(?, '+7 days')").get(today, today).n,
       recentTickets: recentTickets(db, `t.status IN ${ACTIVE} AND ${ticketScope}`, ticketArgs),
       health: health(db),
+      byStatus: Object.fromEntries(db.prepare(`SELECT t.status, COUNT(*) AS n FROM tickets t WHERE t.status IN ${ACTIVE} AND ${ticketScope} GROUP BY t.status`).all(...ticketArgs).map((r) => [r.status, r.n])),
+      byPriority: Object.fromEntries(db.prepare(`SELECT t.priority, COUNT(*) AS n FROM tickets t WHERE t.status IN ${ACTIVE} AND ${ticketScope} GROUP BY t.priority`).all(...ticketArgs).map((r) => [r.priority, r.n])),
+      trend: ticketTrend(db, ticketScope, ticketArgs),
     };
     if (actor.role === "admin") {
       Object.assign(data, {
@@ -82,6 +100,16 @@ function dashboard({ db, actor }) {
         invoicesOverdue: db.prepare("SELECT COUNT(*) AS n FROM invoices WHERE status = 'issued' AND due_date < ?").get(today).n,
         renewalsDue: db.prepare("SELECT COUNT(*) AS n FROM organizations WHERE subscription_status = 'active' AND renewal_date <= date(?, '+14 days')").get(today).n,
         emailFailed: db.prepare("SELECT COUNT(*) AS n FROM email_outbox WHERE status = 'failed'").get().n,
+        finance: db.prepare(`
+          SELECT (SELECT COALESCE(SUM(amount_ugx), 0) FROM payments WHERE status = 'verified' AND confirmed_at >= ?) AS verifiedThisMonth,
+                 (SELECT COALESCE(SUM(amount_ugx), 0) FROM payments WHERE status = 'pending') AS pendingAmount,
+                 (SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'issued') AS outstanding
+        `).get(`${today.slice(0, 7)}-01`),
+        activity: db.prepare(`
+          SELECT a.action, a.entity_type, a.entity_id, a.created_at, u.name AS actor_name, o.name AS organization_name
+          FROM audit_events a LEFT JOIN users u ON u.id = a.actor_id LEFT JOIN organizations o ON o.id = a.organization_id
+          ORDER BY a.id DESC LIMIT 8
+        `).all().map((a) => ({ action: a.action, entityType: a.entity_type, entityId: a.entity_id, at: a.created_at, actorName: a.actor_name || "System", organizationName: a.organization_name || "" })),
       });
     }
     return data;

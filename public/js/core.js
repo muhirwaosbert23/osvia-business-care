@@ -110,6 +110,10 @@ const ICONS = {
   remote: "M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
   clip: "M21.4 11.1 12.2 20.3a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7L9.4 17.5a2 2 0 0 1-2.8-2.8l8.5-8.5",
   calendar: "M3 4h18v18H3zM16 2v4M8 2v4M3 10h18",
+  lock: "M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4",
+  clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M12 7v5l3 2",
+  activity: "M22 12h-4l-3 9L9 3l-3 9H2",
+  smartphone: "M7 2h10v20H7zM11 18h2",
 };
 
 export function icon(name, cls = "icon") {
