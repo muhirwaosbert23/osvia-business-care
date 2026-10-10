@@ -2,7 +2,8 @@ import {
   api, badge, button, card, CATEGORIES, clear, dataTable, definitionList, download, empty, enumOptions, errorBox, fmtDate, fmtDateTime, fmtRelative,
   formDialog, h, icon, IMPACTS, isRole, isStaff, label, orgOptions, pageHeader, PRIORITIES, skeleton, staffOptions, stat, state, toast,
 } from "./core.js";
-import { securitySetupPage, staffDashboard } from "./pages-dashboard.js";
+import { historyCard } from "./history.js";
+import { loadDashboard } from "./pages-dashboard.js";
 
 const STAFF_TRANSITIONS = {
   new: ["open", "in_progress", "pending_customer", "resolved"],
@@ -21,44 +22,8 @@ function ticketMiniTable(items) {
 }
 
 export async function dashboardPage(main) {
-  if (isStaff() && state.mustEnrollMfa) {
-    securitySetupPage(main);
-    return;
-  }
   clear(main, pageHeader("Dashboard"), skeleton(6));
-  let d;
-  try {
-    d = await api("GET", "/api/dashboard");
-  } catch (error) {
-    clear(main, pageHeader("Dashboard"), errorBox(error, () => dashboardPage(main)));
-    return;
-  }
-  const actions = [button("New ticket", () => newTicketDialog(), { kind: "primary", iconName: "plus" })];
-  if (isStaff()) {
-    staffDashboard(main, d, actions);
-    return;
-  }
-  const org = d.organization;
-  const banners = [];
-  if (org.status === "pending") banners.push(h("div", { class: "banner warn" }, h("strong", {}, "OSVIA is reviewing your registration."), " You can explore the portal. Support requests open once your organization is approved."));
-  if (org.subscriptionStatus === "past_due") banners.push(h("div", { class: "banner bad" }, h("strong", {}, "Your renewal is overdue."), " Pay the open invoice to keep full service. ", isRole("customer_admin") ? h("a", { href: "#/billing" }, "View billing") : null));
-  if (d.onboardingIncomplete) banners.push(h("div", { class: "banner info" }, h("strong", {}, "Finish setting up."), " Follow the checklist to get full support. ", h("a", { href: "#/organization" }, "Open checklist")));
-  if (d.windows.length) banners.push(...d.windows.map((w) => h("div", { class: "banner info" }, icon("calendar"), h("strong", {}, ` Planned maintenance: ${w.title}`), ` from ${fmtDateTime(w.startsAt)} to ${fmtDateTime(w.endsAt)}.`)));
-  clear(main,
-    pageHeader(org.name, `${org.planName ? `${org.planName} plan` : "No plan yet"} · ${label(org.subscriptionStatus)}${org.renewalDate ? ` · renews ${fmtDate(org.renewalDate)}` : ""}`, org.status === "active" ? actions : []),
-    banners,
-    h("div", { class: "stats" },
-      stat("Open requests", d.tickets.open, { href: "#/tickets" }),
-      stat("Waiting on you", d.tickets.waitingOnYou, { tone: d.tickets.waitingOnYou ? "warn" : "", href: "#/tickets?status=pending_customer" }),
-      stat("Resolved, awaiting confirmation", d.tickets.resolved, { href: "#/tickets?status=resolved" }),
-      stat(isRole("customer_user") ? "My devices online" : "Devices online", `${d.devices.online || 0} / ${d.devices.total || 0}`, { hint: `${d.devices.offline || 0} offline`, href: "#/devices" }),
-      stat("Open incidents", d.incidentsOpen, { tone: d.incidentsOpen ? "bad" : "ok", href: "#/status" }),
-      d.billing ? stat("Unpaid invoices", d.billing.unpaid, { tone: d.billing.overdue ? "bad" : "", hint: d.billing.pending ? `${d.billing.pending} payment(s) being verified` : "", href: "#/billing" }) : null),
-    h("div", { class: "grid-2" },
-      card("Recent requests", ticketMiniTable(d.recentTickets), { actions: h("a", { href: "#/tickets", class: "link" }, "View all") }),
-      card("Upcoming maintenance", d.upcomingMaintenance.length ? h("ul", { class: "mini-list" }, d.upcomingMaintenance.map((m) => h("li", {}, h("span", { class: "grow" }, m.title), h("span", { class: "muted" }, fmtDate(m.nextDue))))) : empty("Nothing scheduled"))),
-    state.config.escalation ? card("Urgent problem?", h("p", {}, state.config.escalation, state.config.supportPhone ? h("strong", {}, ` Support line: ${state.config.supportPhone}`) : null), { cls: "subtle" }) : null,
-  );
+  await loadDashboard(main);
 }
 
 function slaCell(t) {
@@ -189,7 +154,8 @@ function render(main, data) {
         card(null, [h("article", { class: "msg customer first" }, h("header", {}, h("strong", {}, t.requesterName), h("time", {}, fmtDateTime(t.createdAt))), h("p", { class: "pre" }, t.description))]),
         t.resolutionSummary ? card("Resolution", h("p", { class: "pre" }, t.resolutionSummary), { cls: "ok-card" }) : null,
         card("Conversation", [timeline.length ? h("div", { class: "timeline" }, timeline.map((x) => x.el)) : h("p", { class: "muted" }, "No replies yet."), replyBox]),
-        attachments),
+        attachments,
+        historyCard("ticket", t.id)),
       h("aside", { class: "detail-side" }, side)));
 }
 
@@ -250,6 +216,7 @@ function staffControls(t, reload) {
   });
   const summary = h("textarea", { rows: 3, maxlength: 8000, "aria-label": "Resolution summary", placeholder: "What was done to fix it (shown to the customer)" });
   summary.value = t.resolutionSummary;
+  const reason = h("input", { type: "text", maxlength: 300, "aria-label": "Reason for this change", placeholder: "e.g. Customer called, whole office offline" });
   const save = button("Save changes", async () => {
     const body = {};
     if (status.value !== t.status) body.status = status.value;
@@ -262,6 +229,7 @@ function staffControls(t, reload) {
       toast("Nothing changed.");
       return;
     }
+    if (reason.value.trim()) body.reason = reason.value.trim();
     await api("PATCH", `/api/tickets/${t.id}`, body);
     toast("Ticket updated.");
     await reload();
@@ -279,6 +247,7 @@ function staffControls(t, reload) {
     h("label", { class: "field" }, h("span", {}, "Category"), category),
     h("label", { class: "field" }, h("span", {}, "Impact"), impact),
     h("label", { class: "field" }, h("span", {}, "Resolution summary"), summary),
+    h("label", { class: "field" }, h("span", {}, "Why (optional, kept in history)"), reason),
     h("small", { class: "muted" }, "A resolution summary is required to resolve. Changing priority or category recalculates the SLA from the ticket's creation time."),
     save));
 }

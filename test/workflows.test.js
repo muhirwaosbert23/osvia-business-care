@@ -110,7 +110,7 @@ describe("tenant isolation", () => {
 
   test("customers cannot use staff-only endpoints", async () => {
     assert.equal((await ctx.custA.patch(`/api/tickets/${ticketA.id}`, { status: "resolved" })).status, 403);
-    assert.equal((await ctx.custA.post("/api/monitors", { organizationId: ctx.orgA, name: "x", type: "ping", target: "8.8.8.8" })).status, 403);
+    assert.equal((await ctx.custA.post("/api/monitors", { organizationId: ctx.orgA, name: "x", type: "ping", target: "8.8.8.8" })).status, 400);
     assert.equal((await ctx.custA.patch(`/api/devices/${deviceA.id}`, { address: "10.0.0.5" })).status, 403);
     assert.equal((await ctx.custA.post("/api/invoices", { organizationId: ctx.orgA, amount: 1000 })).status, 403);
     assert.equal((await ctx.userA.get("/api/invoices")).status, 403);

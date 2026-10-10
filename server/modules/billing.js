@@ -1,6 +1,6 @@
 import { assertOrgAccess, isStaff, requireOperationalOrg, requireRole, scopeOrgId } from "../auth.js";
 import { PAYMENT_METHODS, SUBSCRIPTION_STATUSES } from "../constants.js";
-import { audit, getSetting, transaction } from "../db.js";
+import { audit, changes, getSetting, transaction } from "../db.js";
 import { HttpError } from "../errors.js";
 import { reply, sendFile } from "../http.js";
 import { customerAdminIds, notifyUsers, staffIds } from "../notify.js";
@@ -70,7 +70,7 @@ function updatePlan({ db, actor, params, body }) {
   const f = planFields(body, row);
   const keys = Object.keys(f);
   db.prepare(`UPDATE service_plans SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE id = ?`).run(...keys.map((k) => f[k]), row.id);
-  audit(db, actor.id, "plan.update", "service_plan", row.id, null, { price: f.price_ugx, active: f.active }, actor.ip);
+  audit(db, actor.id, "plan.update", "service_plan", row.id, null, { changes: changes(row, f, keys), reason: nullableText(body.reason, 300, "Reason") }, actor.ip);
   return { plan: mapPlan(db.prepare("SELECT * FROM service_plans WHERE id = ?").get(row.id)) };
 }
 
@@ -94,7 +94,10 @@ function changeSubscription({ db, actor, params, body }) {
   transaction(db, () => {
     db.prepare("UPDATE organizations SET plan_id = ?, subscription_status = ? WHERE id = ?").run(planId, status, org.id);
     subscriptionEvent(db, org.id, org.subscription_status, status, planId, actor.id, note || (planId !== org.plan_id ? "Plan changed" : null));
-    audit(db, actor.id, "subscription.update", "organization", org.id, org.id, { planId, status }, actor.ip);
+    audit(db, actor.id, "subscription.update", "organization", org.id, org.id, {
+      changes: changes(org, { plan_id: planId, subscription_status: status }, ["plan_id", "subscription_status"]),
+      reason: note,
+    }, actor.ip);
     if (status !== org.subscription_status) {
       notifyUsers(db, customerAdminIds(db, org.id), { title: `Subscription ${status.replace("_", " ")}`, body: note || "Your OSVIA subscription status changed.", kind: "billing", link: "billing" });
     }
@@ -349,7 +352,7 @@ function verifyPayment({ db, actor, params, body }) {
   const now = nowIso();
   transaction(db, () => {
     db.prepare("UPDATE payments SET status = 'verified', confirmed_by = ?, confirmed_at = ?, reconciliation_note = ? WHERE id = ? AND status = 'pending'").run(actor.id, now, note, row.id);
-    audit(db, actor.id, "payment.verify", "payment", row.id, row.organization_id, { amount: row.amount_ugx }, actor.ip);
+    audit(db, actor.id, "payment.verify", "payment", row.id, row.organization_id, { amount: row.amount_ugx, reason: note, changes: { status: ["pending", "verified"] } }, actor.ip);
     if (row.invoice_id) {
       const invoice = db.prepare(`${INVOICE_SELECT} WHERE i.id = ?`).get(row.invoice_id);
       if (invoice.status === "issued" && invoice.paid_amount >= invoice.amount) {

@@ -1,6 +1,6 @@
-import { api, button, clear, currentQuery, errorBox, h, icon, pageHeader, state } from "./core.js";
+import { api, button, clear, currentQuery, errorBox, h, icon, pageHeader, state, toast } from "./core.js";
 import { accountPage, auditPage, myOrganizationPage, notificationsPage, organizationDetailPage, organizationsPage, reportsPage, settingsPage, teamPage } from "./pages-admin.js";
-import { deviceDetailPage, devicesPage, maintenancePage } from "./pages-assets.js";
+import { deviceDetailPage, devicesPage, maintenancePage, mapPage, remoteDeskPage } from "./pages-assets.js";
 import { invitePage, loginPage, registerPage, setupPage } from "./pages-auth.js";
 import { billingPage } from "./pages-billing.js";
 import { dashboardPage, ticketDetailPage, ticketsPage } from "./pages-main.js";
@@ -15,10 +15,12 @@ const NAV = [
   { path: "tickets", label: "Tickets", icon: "ticket", roles: ALL },
   { path: "organizations", label: "Organizations", icon: "building", roles: STAFF },
   { path: "devices", label: "Devices", icon: "device", roles: ALL },
+  { path: "map", label: "Map", icon: "map", roles: STAFF },
+  { path: "remote", label: "Remote desk", icon: "remote", roles: STAFF },
   { path: "maintenance", label: "Maintenance", icon: "wrench", roles: ["admin", "technician", "customer_admin"] },
   { path: "monitoring", label: "Monitoring", icon: "pulse", roles: STAFF },
   { path: "incidents", label: "Incidents", icon: "alert", roles: STAFF },
-  { path: "status", label: "Service status", icon: "pulse", roles: ["customer_admin", "customer_user"] },
+  { path: "status", label: "Websites & status", icon: "pulse", roles: ["customer_admin", "customer_user"] },
   { path: "billing", label: "Billing", icon: "money", roles: ["admin", "customer_admin"] },
   { path: "reports", label: "Reports", icon: "chart", roles: ["admin", "technician", "customer_admin"] },
   { path: "organization", label: "Organization", icon: "building", roles: ["customer_admin"] },
@@ -36,6 +38,8 @@ const ROUTES = [
   ["organization", myOrganizationPage],
   ["devices", devicesPage],
   ["devices/:id", deviceDetailPage],
+  ["map", mapPage],
+  ["remote", remoteDeskPage],
   ["maintenance", maintenancePage],
   ["monitoring", monitoringPage],
   ["monitoring/:id", monitorDetailPage],
@@ -53,7 +57,7 @@ const ROUTES = [
 ];
 
 const ROUTE_ROLES = {
-  organizations: STAFF, monitoring: STAFF, "maintenance-windows": STAFF, incidents: ALL, team: ["admin"], settings: ["admin"],
+  organizations: STAFF, map: STAFF, remote: STAFF, "maintenance-windows": STAFF, incidents: ALL, team: ["admin"], settings: ["admin"],
   billing: ["admin", "customer_admin"], reports: ["admin", "technician", "customer_admin"], audit: ["admin", "customer_admin"],
   organization: ["customer_admin"], maintenance: ["admin", "technician", "customer_admin"],
 };
@@ -71,6 +75,7 @@ function buildShell() {
   const main = h("main", { id: "main", class: "main", tabindex: "-1" });
   const nav = h("nav", { class: "nav", "aria-label": "Main" });
   const bell = h("a", { href: "#/notifications", class: "icon-btn", title: "Notifications", "aria-label": "Notifications" }, icon("bell"), h("span", { class: "count hidden" }));
+  const live = h("span", { class: "live-pill", title: "Connecting to live checks…", "aria-live": "polite" }, h("i", { class: "live-dot" }), "Live");
   const themeBtn = h("button", { type: "button", class: "icon-btn", title: "Switch light or dark theme", "aria-label": "Switch theme", onclick: () => {
     applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     clear(themeBtn, icon(document.documentElement.dataset.theme === "dark" ? "sun" : "moon"));
@@ -83,11 +88,12 @@ function buildShell() {
       button("Sign out", async () => {
         await api("POST", "/api/logout").catch(() => {});
         state.me = null;
+        stopLive();
         location.hash = "#/login";
         boot();
       }, { kind: "ghost small block", iconName: "logout" })));
   const toggle = h("button", { type: "button", class: "icon-btn menu-btn", "aria-label": "Open menu", onclick: () => document.body.classList.toggle("nav-open") }, icon("menu"));
-  const topbar = h("header", { class: "topbar" }, toggle, h("div", { class: "topbar-title" }, state.org ? state.org.name : "OSVIA TECHNOLOGIES"), h("div", { class: "spacer" }), themeBtn, bell, h("a", { href: "#/account", class: "icon-btn", title: "Account", "aria-label": "Account" }, icon("user")));
+  const topbar = h("header", { class: "topbar" }, toggle, h("div", { class: "topbar-title" }, state.org ? state.org.name : "OSVIA TECHNOLOGIES"), live, h("div", { class: "spacer" }), themeBtn, bell, h("a", { href: "#/account", class: "icon-btn", title: "Account", "aria-label": "Account" }, icon("user")));
   const scrim = h("div", { class: "scrim", onclick: () => document.body.classList.remove("nav-open") });
   clear(root, h("a", { href: "#main", class: "skip" }, "Skip to content"), h("div", { class: "layout" }, sidebar, scrim, h("div", { class: "content" }, topbar, main)));
   for (const item of NAV.filter((n) => n.roles.includes(state.me.role))) {
@@ -95,7 +101,7 @@ function buildShell() {
     nav.append(h("a", { href: `#/${item.path}`, dataset: { path: item.path }, class: locked ? "locked" : null, title: locked ? "Turn on two-factor authentication to unlock" : null },
       icon(item.icon), h("span", {}, item.label), locked ? icon("lock", "icon tiny lock-mark") : null));
   }
-  shell = { main, nav, bell };
+  shell = { main, nav, bell, live };
 }
 
 function initials(name) {
@@ -134,8 +140,12 @@ function matchRoute(path) {
   return null;
 }
 
-async function route() {
-  for (const open of document.querySelectorAll("dialog.modal")) open.remove();
+async function route({ silent = false } = {}) {
+  if (!silent) {
+    for (const open of document.querySelectorAll("dialog.modal")) open.remove();
+  } else if (document.querySelector("dialog.modal")) {
+    return;
+  }
   const path = parseHash();
   if (path.startsWith("invite/")) return invitePage(root, path.slice(7), boot);
   if (!state.me) {
@@ -173,8 +183,58 @@ async function route() {
   } catch (error) {
     clear(shell.main, errorBox(error, route));
   }
-  shell.main.focus({ preventScroll: true });
-  window.scrollTo(0, 0);
+  if (!silent) {
+    shell.main.focus({ preventScroll: true });
+    window.scrollTo(0, 0);
+  }
+}
+
+let liveSource = null;
+let liveRetry = 0;
+
+function setLiveState(mode, title) {
+  if (!shell?.live) return;
+  shell.live.className = `live-pill ${mode}`;
+  shell.live.title = title;
+}
+
+function livePath() {
+  const path = parseHash();
+  return ["dashboard", "devices", "status", "monitoring", "incidents"].some((p) => path === p || path.startsWith(`${p}/`));
+}
+
+function connectLive() {
+  if (!state.me || liveSource) return;
+  const source = new EventSource("/api/events");
+  liveSource = source;
+  source.addEventListener("hello", () => {
+    liveRetry = 0;
+    setLiveState("on", "Live. Device checks run every 15 seconds and this page updates when something changes.");
+  });
+  source.addEventListener("device.status", (event) => {
+    const data = JSON.parse(event.data);
+    toast(data.status === "offline" ? `${data.name} went offline` : `${data.name} is back online`, data.status === "offline" ? "error" : "ok");
+    document.dispatchEvent(new CustomEvent("osvia:unread"));
+    if (livePath()) route({ silent: true });
+  });
+  source.addEventListener("notification", (event) => {
+    const data = JSON.parse(event.data);
+    if (data.kind !== "device") toast(data.title);
+    document.dispatchEvent(new CustomEvent("osvia:unread"));
+    if (livePath() && data.kind !== "device") route({ silent: true });
+  });
+  source.onerror = () => {
+    setLiveState("off", "Live connection lost. Reconnecting…");
+    source.close();
+    liveSource = null;
+    liveRetry = Math.min(liveRetry + 1, 6);
+    setTimeout(connectLive, 2000 * liveRetry);
+  };
+}
+
+function stopLive() {
+  liveSource?.close();
+  liveSource = null;
 }
 
 async function boot() {
@@ -197,9 +257,11 @@ async function boot() {
     state.mustEnrollMfa = me.mustEnrollMfa;
   } catch {
     state.me = null;
+    stopLive();
   }
   await route();
   refreshUnread();
+  if (state.me) connectLive();
 }
 
 window.addEventListener("hashchange", () => {

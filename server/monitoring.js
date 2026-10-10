@@ -1,9 +1,14 @@
+import dns from "node:dns/promises";
+import net from "node:net";
 import tls from "node:tls";
-import { setHealth, transaction } from "./db.js";
+import { recordDeviceStatus, setHealth, transaction } from "./db.js";
+import { publish } from "./live.js";
 import { HttpError } from "./errors.js";
-import { customerAdminIds, notifyUsers, staffIds } from "./notify.js";
+import { customerAdminIds, notifyUsers, orgWatchers, staffIds } from "./notify.js";
 import { assertHost, pingHost, probe, tcpOpen } from "./probe.js";
 import { nowIso } from "./validate.js";
+
+export const PUBLIC_ONLY_SQL = "COALESCE((SELECT role IN ('customer_admin', 'customer_user') FROM users WHERE id = m.created_by), 0)";
 
 export function assertMonitorTarget(type, target) {
   if (type === "http") {
@@ -19,6 +24,38 @@ export function assertMonitorTarget(type, target) {
     return url.toString();
   }
   return assertHost(target);
+}
+
+const PRIVATE_RANGES = new net.BlockList();
+for (const [prefix, bits] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["224.0.0.0", 3]]) {
+  PRIVATE_RANGES.addSubnet(prefix, bits, "ipv4");
+}
+for (const [prefix, bits] of [["::", 127], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]]) PRIVATE_RANGES.addSubnet(prefix, bits, "ipv6");
+
+export function isPrivateAddress(address) {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+  if (mapped) return PRIVATE_RANGES.check(mapped[1], "ipv4");
+  return PRIVATE_RANGES.check(address, net.isIPv6(address) ? "ipv6" : "ipv4");
+}
+
+// Customer-added websites must resolve only to public addresses, so they cannot be used to probe OSVIA's own network.
+export async function assertPublicUrl(target) {
+  const url = new URL(target);
+  if (url.port && !["80", "443", "8080", "8443"].includes(url.port)) throw new HttpError(400, "Use a standard web port (80, 443, 8080 or 8443).");
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  let addresses;
+  if (net.isIP(host)) addresses = [host];
+  else {
+    try {
+      addresses = (await dns.lookup(host, { all: true, verbatim: true })).map((a) => a.address);
+    } catch {
+      throw new HttpError(400, "That website address could not be found. Check the spelling.");
+    }
+  }
+  if (!addresses.length || addresses.some(isPrivateAddress)) {
+    throw new HttpError(400, "Only public website addresses can be added here. Ask OSVIA to monitor internal systems for you.");
+  }
+  return url.toString();
 }
 
 export function statusMatches(expected, code) {
@@ -46,10 +83,17 @@ function certificateExpiry(hostname, port, timeoutMs) {
 export async function checkMonitor(monitor) {
   const started = Date.now();
   if (monitor.type === "http") {
+    if (monitor.public_only) {
+      try {
+        await assertPublicUrl(monitor.target);
+      } catch (error) {
+        return { ok: false, responseMs: null, statusCode: null, error: error.message.slice(0, 120), sslExpiresAt: null };
+      }
+    }
     try {
       const response = await fetch(monitor.target, {
         method: "GET",
-        redirect: "follow",
+        redirect: monitor.public_only ? "manual" : "follow",
         signal: AbortSignal.timeout(monitor.timeout_ms),
         headers: { "User-Agent": "OSVIA-Business-Care-Monitor/1.0" },
       });
@@ -135,7 +179,7 @@ export function recordMonitorResult(db, monitor, result) {
 
 export async function runDueMonitors(db, now = new Date()) {
   const due = db.prepare(`
-    SELECT * FROM monitors WHERE active = 1
+    SELECT *, ${PUBLIC_ONLY_SQL} AS public_only FROM monitors m WHERE active = 1
       AND (last_checked_at IS NULL OR datetime(last_checked_at, '+' || interval_seconds || ' seconds') <= datetime(?))
     ORDER BY last_checked_at LIMIT 25
   `).all(now.toISOString());
@@ -154,21 +198,47 @@ export function monitorFreshness(monitor, now = Date.now()) {
   return monitor.status;
 }
 
+export function announceDeviceStatus(db, device, previous, status, at) {
+  if (!["online", "offline"].includes(status) || previous === status) return;
+  const watchers = orgWatchers(db, device.organization_id, [device.assigned_user_id]);
+  const offline = status === "offline";
+  notifyUsers(db, watchers, {
+    title: offline ? `${device.name} went offline` : `${device.name} is back online`,
+    body: offline
+      ? `The last successful check was ${device.last_connection || "never"}. OSVIA opened an incident if the device is in service.`
+      : "The device answered a check again.",
+    kind: "device",
+    link: `devices/${device.id}`,
+    marker: `device-status:${device.id}:${status}:${at}`,
+  });
+  publish(watchers, "device.status", {
+    deviceId: device.id,
+    organizationId: device.organization_id,
+    name: device.name,
+    status,
+    previous: previous || "unknown",
+    at,
+  });
+}
+
 export async function applyDeviceCheck(db, deviceId) {
   const device = db.prepare("SELECT * FROM devices WHERE id = ?").get(deviceId);
   if (!device) return null;
   if (!device.address || device.source === "meshcentral") return device;
   const reachability = await probe(device.address, device.check_port);
   const checkedAt = nowIso();
+  const changed = device.reachability !== reachability;
   transaction(db, () => {
     db.prepare("UPDATE devices SET reachability = ?, last_checked = ?, last_connection = CASE WHEN ? = 'online' THEN ? ELSE last_connection END WHERE id = ?").run(
       reachability, checkedAt, reachability, checkedAt, deviceId,
     );
-    if (reachability === "offline" && device.reachability !== "offline" && !inMaintenance(db, device.organization_id, checkedAt) && device.operational_status === "in_service") {
+    recordDeviceStatus(db, deviceId, device.reachability, reachability, "network_check", checkedAt);
+    if (reachability === "offline" && changed && !inMaintenance(db, device.organization_id, checkedAt) && device.operational_status === "in_service") {
       openIncident(db, { organizationId: device.organization_id, deviceId, title: `${device.name} stopped responding`, severity: "minor", customerVisible: true });
     }
     if (reachability === "online") resolveIncident(db, "device_id", deviceId, "The device answered a check again.");
   });
+  if (changed) announceDeviceStatus(db, device, device.reachability, reachability, checkedAt);
   return db.prepare("SELECT * FROM devices WHERE id = ?").get(deviceId);
 }
 

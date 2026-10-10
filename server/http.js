@@ -28,10 +28,10 @@ export function reply(status, body, headers) {
 export function securityHeaders() {
   const headers = {
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "same-origin",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Content-Security-Policy": "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self' https://www.google.com https://maps.google.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(self)",
     "Cross-Origin-Opener-Policy": "same-origin",
   };
   if (process.env.COOKIE_SECURE === "true") headers["Strict-Transport-Security"] = "max-age=31536000";

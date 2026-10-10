@@ -1,6 +1,6 @@
 import { requireRole, requireStaff } from "../auth.js";
 import { CATEGORIES, PRIORITIES } from "../constants.js";
-import { audit } from "../db.js";
+import { audit, changes } from "../db.js";
 import { HttpError } from "../errors.js";
 import { reply } from "../http.js";
 import { isValidTimeZone } from "../sla.js";
@@ -85,7 +85,7 @@ function update({ db, actor, params, body }) {
   const f = fields(db, body, row);
   const keys = Object.keys(f);
   db.prepare(`UPDATE sla_policies SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE id = ?`).run(...keys.map((k) => f[k]), row.id);
-  audit(db, actor.id, "sla_policy.update", "sla_policy", row.id, null, null, actor.ip);
+  audit(db, actor.id, "sla_policy.update", "sla_policy", row.id, null, { changes: changes(row, f, keys) }, actor.ip);
   return { policy: mapPolicy(db.prepare(`${POLICY_SELECT} WHERE s.id = ?`).get(row.id)), note: "New targets apply to tickets created or reprioritized from now on." };
 }
 

@@ -1,11 +1,14 @@
-import { isStaff, requireMfa, requireOperationalOrg, requireRole, requireStaff, scopeOrgId } from "../auth.js";
+import { isStaff, rateLimit, requireMfa, requireOperationalOrg, requireRole, requireStaff, scopeOrgId } from "../auth.js";
 import { ASSET_TYPES, CONDITIONS, OPERATIONAL_STATUSES } from "../constants.js";
 import { streamCsv } from "../csv.js";
-import { audit, transaction } from "../db.js";
+import { audit, changes, transaction } from "../db.js";
 import { HttpError } from "../errors.js";
 import { reply, startStream } from "../http.js";
-import { remoteLaunchUrl } from "../meshcentral.js";
+import { geocodePlace, lookupPublicIp } from "../geo.js";
+import { locationHistory, mapLocation, refreshDeviceLocations, saveLocation } from "../location.js";
+import { meshConfig, meshConfigured, remoteLaunchUrl, syncDevices } from "../meshcentral.js";
 import { applyDeviceCheck } from "../monitoring.js";
+import { diagnoseHost, packTroubleshoot } from "../troubleshoot.js";
 import { customerAdminIds, notifyUsers } from "../notify.js";
 import { assertHost } from "../probe.js";
 import { assertEnum, assertId, assertText, likePattern, nowIso, nullableText, optionalDate, optionalInt, pageParams } from "../validate.js";
@@ -45,6 +48,8 @@ function mapDevice(row, actor) {
     createdAt: row.created_at,
   };
   if (isStaff(actor)) {
+    data.hasLocation = row.last_lat != null;
+    data.location = mapLocation(row);
     data.address = row.address || "";
     data.checkPort = row.check_port;
     data.meshNodeId = row.mesh_node_id || "";
@@ -59,7 +64,7 @@ function scope(actor) {
   return { sql: "d.organization_id = ? AND d.assigned_user_id = ?", args: [actor.organizationId, actor.id] };
 }
 
-function loadDevice(db, actor, id) {
+export function loadDevice(db, actor, id) {
   const s = scope(actor);
   const row = db.prepare(`${DEVICE_SELECT} WHERE d.id = ? AND ${s.sql}`).get(id, ...s.args);
   if (!row) throw new HttpError(404, "Not found.");
@@ -138,7 +143,7 @@ function networkFields(actor, body, current = {}) {
   if (!isStaff(actor)) throw new HttpError(403, "Only OSVIA staff can set the address used for status checks.");
   const address = body.address === undefined ? current.address : (String(body.address || "").trim() ? assertHost(body.address) : null);
   const checkPort = body.checkPort === undefined ? current.check_port : optionalInt(body.checkPort, "Check port", 1, 65535);
-  return { address, check_port: address ? checkPort : null };
+  return { address, check_port: address ? (checkPort ?? null) : null };
 }
 
 function create({ db, actor, body }) {
@@ -162,6 +167,12 @@ function create({ db, actor, body }) {
     `).run(organizationId, ...keys.map((k) => fields[k]), assigned, now, now);
     const deviceId = Number(info.lastInsertRowid);
     if (assigned) db.prepare("INSERT INTO device_assignments (device_id, user_id, assigned_by, note, created_at) VALUES (?, ?, ?, 'Initial assignment', ?)").run(deviceId, assigned, actor.id, now);
+    if (isStaff(actor) && body.meshNodeId) {
+      const raw = String(body.meshNodeId || "").trim();
+      if (raw && !/^(node\/)?[A-Za-z0-9/@$_.-]+$/.test(raw)) throw new HttpError(400, "That MeshCentral node id has unexpected characters.");
+      const meshNodeId = raw ? (raw.startsWith("node/") ? raw : `node//${raw}`) : null;
+      if (meshNodeId) db.prepare("UPDATE devices SET mesh_node_id = ?, source = 'meshcentral', management_status = 'agent_installed' WHERE id = ?").run(meshNodeId, deviceId);
+    }
     audit(db, actor.id, "device.create", "device", deviceId, organizationId, null, actor.ip);
     return deviceId;
   });
@@ -183,7 +194,78 @@ function get({ db, actor, params }) {
   const remote = db.prepare(`
     SELECT r.*, u.name AS technician FROM remote_sessions r JOIN users u ON u.id = r.technician_id WHERE r.device_id = ? ORDER BY r.id DESC LIMIT 50
   `).all(row.id).map((r) => ({ id: r.id, technician: r.technician, mode: r.mode, reason: r.reason, ticketId: r.ticket_id, launchedAt: r.launched_at }));
-  return { device: mapDevice(row, actor), assignments, maintenance, tickets, remoteSessions: remote };
+  const findings = isStaff(actor)
+    ? db.prepare(`
+        SELECT f.*, u.name AS actor_name FROM device_findings f JOIN users u ON u.id = f.created_by
+        WHERE f.device_id = ? ORDER BY f.id DESC LIMIT 40
+      `).all(row.id).map((f) => ({ id: f.id, kind: f.kind, body: f.body, actorName: f.actor_name, at: f.created_at }))
+    : [];
+  return {
+    device: mapDevice(row, actor),
+    assignments,
+    maintenance,
+    tickets,
+    remoteSessions: remote,
+    findings,
+    troubleshoot: isStaff(actor) ? packTroubleshoot(row) : null,
+  };
+}
+
+const DAY_MS = 86400000;
+
+// Time is "known" only between a recorded status change and the device's most recent real check.
+export function availability(events, { from, to, lastChecked, days }) {
+  const knownUntil = lastChecked ? Math.min(to, Date.parse(lastChecked)) : from;
+  const daily = Array.from({ length: days }, (_, i) => ({ day: new Date(from + i * DAY_MS).toISOString().slice(0, 10), onlineMs: 0, knownMs: 0 }));
+  let onlineMs = 0;
+  let knownMs = 0;
+  events.forEach((event, index) => {
+    const start = Math.max(from, Date.parse(event.created_at));
+    const end = Math.min(knownUntil, index + 1 < events.length ? Date.parse(events[index + 1].created_at) : knownUntil);
+    if (end <= start) return;
+    knownMs += end - start;
+    if (event.status === "online") onlineMs += end - start;
+    for (let cursor = start; cursor < end;) {
+      const dayIndex = Math.floor((cursor - from) / DAY_MS);
+      const dayEnd = Math.min(end, from + (dayIndex + 1) * DAY_MS);
+      if (daily[dayIndex]) {
+        daily[dayIndex].knownMs += dayEnd - cursor;
+        if (event.status === "online") daily[dayIndex].onlineMs += dayEnd - cursor;
+      }
+      cursor = dayEnd;
+    }
+  });
+  const pct = (online, known) => (known > 0 ? Math.round((online / known) * 10000) / 100 : null);
+  return {
+    uptimePercent: pct(onlineMs, knownMs),
+    coveragePercent: Math.round((knownMs / (to - from)) * 1000) / 10,
+    daily: daily.map((d) => ({ day: d.day, uptimePercent: pct(d.onlineMs, d.knownMs), coveredHours: Math.round(d.knownMs / 360000) / 10 })),
+  };
+}
+
+function availabilityRoute({ db, actor, params, url }) {
+  const row = loadDevice(db, actor, params.id);
+  const days = Number(url.searchParams.get("days")) === 90 ? 90 : Number(url.searchParams.get("days")) === 7 ? 7 : 30;
+  const to = Date.now();
+  const from = to - days * DAY_MS;
+  const fromIso = new Date(from).toISOString();
+  const before = db.prepare("SELECT * FROM device_status_events WHERE device_id = ? AND created_at < ? ORDER BY id DESC LIMIT 1").get(row.id, fromIso);
+  const inside = db.prepare("SELECT * FROM device_status_events WHERE device_id = ? AND created_at >= ? ORDER BY id").all(row.id, fromIso);
+  const events = before ? [before, ...inside] : inside;
+  const recent = db.prepare("SELECT * FROM device_status_events WHERE device_id = ? ORDER BY id DESC LIMIT 50").all(row.id);
+  return {
+    days,
+    source: row.source === "meshcentral" ? "meshcentral" : row.address ? "network_check" : "none",
+    lastChecked: row.last_checked,
+    ...availability(events, { from, to, lastChecked: row.last_checked, days }),
+    changes: recent.map((e, i) => ({
+      status: e.status,
+      previousStatus: e.previous_status,
+      source: e.source,
+      at: e.created_at,
+      lastedMinutes: i === 0 ? null : Math.round((Date.parse(recent[i - 1].created_at) - Date.parse(e.created_at)) / 60000),
+    })),
+  };
 }
 
 function update({ db, actor, params, body }) {
@@ -203,18 +285,30 @@ function update({ db, actor, params, body }) {
         db.prepare("INSERT INTO device_assignments (device_id, user_id, assigned_by, note, created_at) VALUES (?, ?, ?, ?, ?)").run(row.id, assigned, actor.id, nullableText(body.assignmentNote, 300, "Assignment note"), now);
       }
     }
+    if (body.meshNodeId !== undefined) {
+      if (!isStaff(actor)) throw new HttpError(403, "Only OSVIA staff can link a MeshCentral agent.");
+      const raw = String(body.meshNodeId || "").trim();
+      if (raw && !/^(node\/)?[A-Za-z0-9/@$_.-]+$/.test(raw)) throw new HttpError(400, "That MeshCentral node id has unexpected characters.");
+      const meshNodeId = raw ? (raw.startsWith("node/") ? raw : `node//${raw}`) : null;
+      db.prepare("UPDATE devices SET mesh_node_id = ?, source = CASE WHEN ? IS NOT NULL THEN 'meshcentral' ELSE source END, management_status = CASE WHEN ? IS NOT NULL THEN 'agent_installed' ELSE management_status END WHERE id = ?").run(meshNodeId, meshNodeId, meshNodeId, row.id);
+    }
     if (fields.address !== row.address) db.prepare("UPDATE devices SET reachability = 'unknown', last_checked = NULL WHERE id = ?").run(row.id);
-    audit(db, actor.id, "device.update", "device", row.id, row.organization_id, null, actor.ip);
+    const after = db.prepare("SELECT * FROM devices WHERE id = ?").get(row.id);
+    audit(db, actor.id, body.restore === true && row.archived_at ? "device.restore" : "device.update", "device", row.id, row.organization_id, {
+      changes: changes(row, after, [...ASSET_FIELDS.map(([, column]) => column), "address", "check_port", "assigned_user_id", "mesh_node_id"]),
+      reason: nullableText(body.reason ?? body.assignmentNote, 300, "Reason"),
+    }, actor.ip);
   });
   return { device: mapDevice(loadDevice(db, actor, row.id), actor) };
 }
 
-function archive({ db, actor, params }) {
+function archive({ db, actor, params, body }) {
   if (!isStaff(actor)) requireRole(actor, "customer_admin");
   const row = loadDevice(db, actor, params.id);
   if (row.archived_at) throw new HttpError(400, "This device is already archived.");
+  const reason = assertText(body?.reason, "Reason for archiving", 300);
   db.prepare("UPDATE devices SET archived_at = ?, operational_status = 'retired', updated_at = ? WHERE id = ?").run(nowIso(), nowIso(), row.id);
-  audit(db, actor.id, "device.archive", "device", row.id, row.organization_id, null, actor.ip);
+  audit(db, actor.id, "device.archive", "device", row.id, row.organization_id, { reason }, actor.ip);
   return { device: mapDevice(loadDevice(db, actor, row.id), actor) };
 }
 
@@ -229,7 +323,7 @@ function consent(grant) {
     } else {
       db.prepare("UPDATE devices SET consent_at = NULL, updated_at = ? WHERE id = ?").run(nowIso(), row.id);
     }
-    audit(db, actor.id, grant ? "device.consent" : "device.consent_revoke", "device", row.id, row.organization_id, null, actor.ip);
+    audit(db, actor.id, grant ? "device.consent" : "device.consent_revoke", "device", row.id, row.organization_id, { reason: nullableText(body?.reason, 300, "Reason") }, actor.ip);
     return { device: mapDevice(loadDevice(db, actor, row.id), actor) };
   };
 }
@@ -260,7 +354,7 @@ function remote({ db, actor, params, body }) {
   const url = remoteLaunchUrl(row, mode);
   transaction(db, () => {
     const info = db.prepare("INSERT INTO remote_sessions (device_id, organization_id, technician_id, ticket_id, mode, reason, launched_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(row.id, row.organization_id, actor.id, ticketId, mode, reason, nowIso());
-    audit(db, actor.id, "remote.launch", "device", row.id, row.organization_id, { mode, ticketId, session: Number(info.lastInsertRowid) }, actor.ip);
+    audit(db, actor.id, "remote.launch", "device", row.id, row.organization_id, { mode, ticketId, session: Number(info.lastInsertRowid), reason }, actor.ip);
     notifyUsers(db, customerAdminIds(db, row.organization_id), {
       title: `OSVIA opened a remote ${mode} session`,
       body: `${actor.name} started a remote ${mode} session on ${row.name}. Reason: ${reason}`,
@@ -271,15 +365,208 @@ function remote({ db, actor, params, body }) {
   return { url, notice: "MeshCentral asks you to sign in with your own MeshCentral account. The customer can see the session according to their MeshCentral consent settings." };
 }
 
+function getLocation({ db, actor, params }) {
+  requireStaff(actor);
+  const row = loadDevice(db, actor, params.id);
+  return { location: mapLocation(row), ...locationHistory(db, row.id) };
+}
+
+function setLocation({ db, actor, params, body }) {
+  requireStaff(actor);
+  const row = loadDevice(db, actor, params.id);
+  const source = assertEnum(body.source || "manual", ["manual", "gps"], "location source");
+  const location = saveLocation(db, row, {
+    lat: body.lat,
+    lng: body.lng,
+    source,
+    label: nullableText(body.label, 200, "Place name"),
+    accuracyM: body.accuracyM == null || body.accuracyM === "" ? 30 : optionalInt(body.accuracyM, "Accuracy", 1, 50000),
+    actorId: actor.id,
+  });
+  audit(db, actor.id, "device.locate", "device", row.id, row.organization_id, { source, label: location.label }, actor.ip);
+  return { location, device: mapDevice(loadDevice(db, actor, row.id), actor) };
+}
+
+async function locateDevice({ db, actor, params, body, services }) {
+  requireStaff(actor);
+  rateLimit(db, `locate:${actor.id}`, 20, 60, "Too many map lookups in the last hour. Try again later.");
+  const row = loadDevice(db, actor, params.id);
+  const fetchImpl = services?.lookupFetch || fetch;
+  let found;
+  if (body.place) found = await geocodePlace(body.place, fetchImpl);
+  else {
+    const target = String(body.ip || row.address || "").trim();
+    if (!target) throw new HttpError(400, "Add a public IP or host name on the device, or search for a place.");
+    found = await lookupPublicIp(target, fetchImpl);
+  }
+  const location = saveLocation(db, row, { ...found, actorId: actor.id });
+  audit(db, actor.id, "device.locate", "device", row.id, row.organization_id, { source: found.source, label: found.label }, actor.ip);
+  return { location, device: mapDevice(loadDevice(db, actor, row.id), actor), notice: found.source === "ip" ? "This is the public-internet area for that address, not the room the computer sits in." : null };
+}
+
+function mapRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    organizationName: row.organization_name,
+    reachability: row.reachability,
+    source: row.source,
+    lastSeenIp: row.last_seen_ip || "",
+    address: row.address || "",
+    location: mapLocation(row),
+  };
+}
+
+function fleetMap({ db, actor, url }) {
+  requireStaff(actor);
+  const orgId = url.searchParams.get("organizationId");
+  const where = orgId ? "d.organization_id = ? AND d.archived_at IS NULL" : "d.archived_at IS NULL";
+  const args = orgId ? [scopeOrgId(actor, orgId)] : [];
+  const rows = db.prepare(`
+    SELECT d.id, d.name, d.source, d.address, d.last_seen_ip, d.last_lat, d.last_lng, d.last_location_at, d.last_location_source,
+           d.last_location_label, d.last_location_accuracy, d.reachability, o.name AS organization_name
+    FROM devices d JOIN organizations o ON o.id = d.organization_id
+    WHERE ${where} ORDER BY o.name, d.name LIMIT 300
+  `).all(...args).map(mapRow);
+  const items = rows.filter((row) => row.location);
+  const missing = rows.filter((row) => !row.location);
+  return { items, missing, located: items.length, total: rows.length };
+}
+
+async function refreshFleet({ db, actor, services }) {
+  requireStaff(actor);
+  rateLimit(db, `locate-fleet:${actor.id}`, 12, 60, "Location refresh is limited to a few runs per hour.");
+  const fetchImpl = services?.lookupFetch || fetch;
+  let mesh = { status: "skipped", located: 0 };
+  if (meshConfigured()) {
+    mesh = await syncDevices(db, { lookupFetch: fetchImpl });
+  }
+  const detected = await refreshDeviceLocations(db, { lookupFetch: fetchImpl, limit: 40 });
+  return { ...fleetMap({ db, actor, url: new URL("http://localhost/api/devices/map") }), mesh, detected };
+}
+
+function troubleshoot({ db, actor, params }) {
+  requireStaff(actor);
+  const row = loadDevice(db, actor, params.id);
+  return { device: mapDevice(row, actor), ...packTroubleshoot(row) };
+}
+
+async function diagnose({ db, actor, params }) {
+  requireStaff(actor);
+  rateLimit(db, `diagnose:${actor.id}`, 40, 60, "Too many diagnostic runs in the last hour.");
+  const row = loadDevice(db, actor, params.id);
+  const host = String(row.address || row.last_seen_ip || "").trim();
+  if (!host) throw new HttpError(400, "Add an IP address or host name, or sync MeshCentral so the public IP is known.");
+  const result = await diagnoseHost(host, row.check_port);
+  audit(db, actor.id, "device.diagnose", "device", row.id, row.organization_id, { host, ping: result.ping.ok }, actor.ip);
+  return result;
+}
+
+function addFinding({ db, actor, params, body }) {
+  requireStaff(actor);
+  const row = loadDevice(db, actor, params.id);
+  const kind = assertEnum(body.kind || "finding", ["finding", "next_step", "note"], "note type");
+  const text = assertText(body.body, "Note", 2000);
+  const info = db.prepare("INSERT INTO device_findings (device_id, organization_id, created_by, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(row.id, row.organization_id, actor.id, kind, text, nowIso());
+  audit(db, actor.id, "device.finding", "device", row.id, row.organization_id, { kind }, actor.ip);
+  return { finding: { id: Number(info.lastInsertRowid), kind, body: text, actorName: actor.name, at: nowIso() } };
+}
+
+function deskItem(row, configured) {
+  const managed = Boolean(row.mesh_node_id);
+  const consent = Boolean(row.consent_at);
+  const orgActive = row.organization_status === "active";
+  const canDiagnose = Boolean(row.address || row.last_seen_ip);
+  const canCheck = Boolean(row.address && row.source !== "meshcentral");
+  let nextStep = "Open the device to troubleshoot.";
+  let blocked = null;
+  if (!orgActive) {
+    nextStep = "Reactivate the organization first.";
+    blocked = "Organization is not active";
+  } else if (!managed) {
+    nextStep = configured
+      ? (row.mesh_group_id
+        ? "Install the MeshCentral agent on this computer, then press Sync MeshCentral."
+        : "Map this organization's MeshCentral group and sync, or paste the agent node id.")
+      : "Consent is recorded. Configure MeshCentral on the server, map the organization group, then sync.";
+    blocked = "No MeshCentral agent";
+  } else if (!consent) {
+    nextStep = "Ask the customer administrator to allow remote support on this device.";
+    blocked = "Waiting for customer consent";
+  } else if (!configured) {
+    nextStep = "Agent and consent are ready. Set MESHCENTRAL_URL and MeshCtrl in the server .env, then restart.";
+    blocked = "MeshCentral is not configured on this server";
+  } else {
+    nextStep = "Ready. Open desktop, terminal or files. The session is recorded.";
+  }
+  const ready = Boolean(managed && consent && orgActive && configured);
+  return {
+    id: row.id,
+    name: row.name,
+    organizationId: row.organization_id,
+    organizationName: row.organization_name,
+    reachability: row.reachability,
+    operatingSystem: row.operating_system || "",
+    lastChecked: row.last_checked,
+    address: row.address || row.last_seen_ip || "",
+    managed,
+    consent,
+    canDiagnose,
+    canCheck,
+    ready,
+    nextStep,
+    blocked,
+  };
+}
+
+function remoteDesk({ db, actor }) {
+  requireStaff(actor);
+  const configured = meshConfigured();
+  const health = db.prepare("SELECT status, detail FROM integration_health WHERE name = 'meshcentral'").get();
+  const items = db.prepare(`
+    SELECT d.id, d.name, d.organization_id, d.reachability, d.consent_at, d.mesh_node_id, d.operating_system, d.last_checked,
+           d.address, d.last_seen_ip, d.source, o.name AS organization_name, o.status AS organization_status, o.mesh_group_id
+    FROM devices d JOIN organizations o ON o.id = d.organization_id
+    WHERE d.archived_at IS NULL
+    ORDER BY CASE WHEN d.mesh_node_id IS NOT NULL AND d.consent_at IS NOT NULL AND o.status = 'active' THEN 0 ELSE 1 END,
+             CASE d.reachability WHEN 'online' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END, o.name, d.name
+    LIMIT 300
+  `).all().map((row) => deskItem(row, configured));
+  const orgs = db.prepare("SELECT COUNT(*) AS n FROM organizations WHERE status = 'active' AND (mesh_group_id IS NULL OR trim(mesh_group_id) = '')").get().n;
+  return {
+    meshConfigured: configured,
+    meshUrl: configured ? meshConfig().publicUrl : "",
+    meshStatus: health?.status || (configured ? "unknown" : "not_configured"),
+    meshDetail: health?.detail || (configured ? "Not checked yet." : "Set MESHCENTRAL_URL, MESHCTRL_PATH, MESHCENTRAL_USER and a login key file in the server .env."),
+    orgsNeedingGroup: orgs,
+    items,
+    total: items.length,
+    ready: items.filter((item) => item.ready).length,
+    needAgent: items.filter((item) => !item.managed).length,
+    needConsent: items.filter((item) => item.managed && !item.consent).length,
+    canDiagnose: items.filter((item) => item.canDiagnose).length,
+  };
+}
+
 export const routes = [
   ["GET", "/api/devices", list],
   ["POST", "/api/devices", create],
   ["GET", "/api/devices/export.csv", exportCsv],
+  ["GET", "/api/devices/map", fleetMap],
+  ["POST", "/api/devices/map/refresh", refreshFleet],
+  ["GET", "/api/devices/remote", remoteDesk],
   ["GET", "/api/devices/:id", get],
+  ["GET", "/api/devices/:id/availability", availabilityRoute],
+  ["GET", "/api/devices/:id/location", getLocation],
+  ["POST", "/api/devices/:id/location", setLocation],
+  ["POST", "/api/devices/:id/locate", locateDevice],
   ["PATCH", "/api/devices/:id", update],
   ["POST", "/api/devices/:id/archive", archive],
   ["POST", "/api/devices/:id/consent", consent(true)],
   ["POST", "/api/devices/:id/consent/revoke", consent(false)],
   ["POST", "/api/devices/:id/check", checkNow],
   ["POST", "/api/devices/:id/remote", remote],
+  ["GET", "/api/devices/:id/troubleshoot", troubleshoot],
+  ["POST", "/api/devices/:id/diagnose", diagnose],
+  ["POST", "/api/devices/:id/findings", addFinding],
 ];

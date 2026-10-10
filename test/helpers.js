@@ -7,11 +7,11 @@ import { totpCode } from "../server/security.js";
 
 export const PASSWORD = "Correct-Horse-42";
 
-export async function startServer() {
+export async function startServer(services = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "osvia-test-"));
   process.env.DATA_DIR = dataDir;
   const db = openDatabase(":memory:");
-  const server = createApp(db);
+  const server = createApp(db, services);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   return {

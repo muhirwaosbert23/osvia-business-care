@@ -2,6 +2,7 @@ import {
   api, badge, button, card, CATEGORIES, clear, confirmDialog, dataTable, definitionList, dialog, download, empty, enumOptions, errorBox, fmtDate,
   fmtDateTime, fmtRelative, formDialog, h, isRole, isStaff, label, money, orgOptions, pageHeader, PRIORITIES, skeleton, stat, state, toast,
 } from "./core.js";
+import { actionText, historyCard, withReason } from "./history.js";
 import { subscriptionCard } from "./pages-billing.js";
 
 export function organizationsPage(main, query) {
@@ -50,21 +51,19 @@ function usersCard(orgId, reload) {
       { label: "Last sign-in", render: (u) => (u.lastLoginAt ? fmtRelative(u.lastLoginAt) : "Never") },
       { label: "Status", render: (u) => (u.active ? badge("active") : badge("muted", "Disabled")) },
       canManage ? { label: "", render: (u) => (u.id === state.me.id ? h("small", { class: "muted" }, "You") : h("div", { class: "row-actions" },
-        u.organizationId ? button(u.role === "customer_admin" ? "Make user" : "Make admin", async () => {
-          await api("PATCH", `/api/users/${u.id}`, { role: u.role === "customer_admin" ? "customer_user" : "customer_admin" });
+        u.organizationId ? button(u.role === "customer_admin" ? "Make user" : "Make admin", () => withReason(`Change ${u.name}'s role`, u.role === "customer_admin" ? `${u.name} will become a normal user and lose administrator rights.` : `${u.name} will be able to manage users, billing and devices.`, async (reason) => {
+          await api("PATCH", `/api/users/${u.id}`, { role: u.role === "customer_admin" ? "customer_user" : "customer_admin", reason });
           table.refresh();
-        }, { kind: "small ghost" }) : null,
-        button(u.active ? "Disable" : "Enable", async () => {
-          if (u.active && !(await confirmDialog("Disable account", `${u.name} will be signed out and cannot sign in.`, { danger: true, confirmLabel: "Disable" }))) return;
-          await api("PATCH", `/api/users/${u.id}`, { active: !u.active });
+        }, { submitLabel: "Change role" }), { kind: "small ghost" }) : null,
+        button(u.active ? "Disable" : "Enable", () => withReason(u.active ? "Disable account" : "Enable account", u.active ? `${u.name} will be signed out and cannot sign in.` : `${u.name} will be able to sign in again.`, async (reason) => {
+          await api("PATCH", `/api/users/${u.id}`, { active: !u.active, reason });
           table.refresh();
-        }, { kind: "small ghost" }),
-        isRole("admin") && u.mfaEnabled ? button("Reset 2FA", async () => {
-          if (!(await confirmDialog("Reset two-factor", `${u.name} must set up two-factor authentication again at next sign-in.`))) return;
-          await api("POST", `/api/users/${u.id}/reset-mfa`);
+        }, { submitLabel: u.active ? "Disable" : "Enable" }), { kind: "small ghost" }),
+        isRole("admin") && u.mfaEnabled ? button("Reset 2FA", () => withReason("Reset two-factor", `${u.name} must set up two-factor authentication again at next sign-in.`, async (reason) => {
+          await api("POST", `/api/users/${u.id}/reset-mfa`, { reason });
           toast("Two-factor reset.");
           table.refresh();
-        }, { kind: "small ghost" }) : null)) } : null,
+        }, { submitLabel: "Reset", placeholder: "e.g. Lost phone, identity confirmed by phone call" }), { kind: "small ghost" }) : null)) } : null,
     ].filter(Boolean),
     searchPlaceholder: "Search people",
     load: (q) => api("GET", `/api/users?${q}${orgId && isStaff() ? `&organizationId=${orgId}` : !orgId ? "&role=staff" : ""}`),
@@ -134,11 +133,11 @@ export async function organizationDetailPage(main, id) {
     toast("Suspended.");
     reload();
   }, { submitLabel: "Suspend" }), { kind: "ghost danger-text" }));
-  if (admin && o.status === "suspended") actions.push(button("Reactivate", async () => {
-    await api("POST", `/api/organizations/${o.id}/reactivate`);
+  if (admin && o.status === "suspended") actions.push(button("Reactivate", () => withReason(`Reactivate ${o.name}`, "Users can sign in again straight away.", async (reason) => {
+    await api("POST", `/api/organizations/${o.id}/reactivate`, { reason });
     toast("Reactivated.");
     reload();
-  }, { kind: "primary" }));
+  }, { submitLabel: "Reactivate", placeholder: "e.g. Outstanding invoice paid and verified" }), { kind: "primary" }));
   if (admin || isRole("customer_admin")) actions.push(button("Edit", () => editOrgDialog(o, reload), { kind: "ghost" }));
 
   clear(main,
@@ -156,7 +155,8 @@ export async function organizationDetailPage(main, id) {
       onboardingCard(data.onboarding)),
     isRole("admin", "customer_admin") ? subscriptionCard(o, reload) : null,
     isRole("admin", "customer_admin") ? subscriptionHistory(o.id) : null,
-    isRole("admin", "customer_admin", "technician") ? usersCard(o.id, null) : null);
+    isRole("admin", "customer_admin", "technician") ? usersCard(o.id, null) : null,
+    isRole("admin", "customer_admin", "technician") ? historyCard("organization", o.id) : null);
 }
 
 function subscriptionHistory(orgId) {
@@ -241,24 +241,44 @@ function bars(rows) {
   }));
 }
 
+const RECORD_LINKS = { ticket: "tickets", device: "devices", organization: "organizations", monitor: "monitoring", incident: "incidents" };
+
+function recordLink(a) {
+  const text = `${label(a.entityType)}${a.entityId ? ` #${a.entityId}` : ""}`;
+  const base = RECORD_LINKS[a.entityType];
+  if (!base || !a.entityId) return text;
+  if (base === "organizations" && !isStaff()) return h("a", { href: "#/organization" }, text);
+  return h("a", { href: `#/${base}/${a.entityId}` }, text);
+}
+
 export function auditPage(main) {
   const actor = h("input", { type: "search", placeholder: "Person", "aria-label": "Person" });
+  const words = h("input", { type: "search", placeholder: "Reason or detail", "aria-label": "Reason or detail" });
+  const apply = () => {
+    table.params.actor = actor.value;
+    table.params.q = words.value;
+    table.params.page = 1;
+    return table.refresh();
+  };
+  for (const input of [actor, words]) input.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
   const table = dataTable({
     columns: [
-      { label: "Time", render: (a) => fmtDateTime(a.createdAt) },
-      { label: "Person", render: (a) => h("div", {}, a.actorName, h("small", { class: "muted block" }, a.actorEmail)) },
-      { label: "Action", render: (a) => h("span", { class: "mono small" }, a.action) },
-      { label: "Record", render: (a) => `${a.entityType}${a.entityId ? ` #${a.entityId}` : ""}` },
+      { label: "When", render: (a) => h("div", {}, fmtDateTime(a.createdAt), h("small", { class: "muted block" }, fmtRelative(a.createdAt))) },
+      { label: "Who", render: (a) => h("div", {}, a.actorName, h("small", { class: "muted block" }, a.actorEmail || label(a.actorRole || "system"))) },
+      { label: "What", render: (a) => h("div", { class: "audit-what" },
+        h("span", {}, actionText(a.action)),
+        a.changes.length ? h("ul", { class: "change-list compact" }, a.changes.slice(0, 4).map((c) => h("li", {}, h("span", { class: "change-field" }, label(c.field)), h("span", { class: "change-from" }, c.from ?? "empty"), h("span", { class: "change-arrow" }, "→"), h("span", { class: "change-to" }, c.to ?? "empty")))) : null) },
+      { label: "Why", render: (a) => (a.reason ? h("span", { class: "reason-text" }, a.reason) : h("span", { class: "muted" }, "—")) },
+      { label: "Record", render: (a) => h("div", {}, recordLink(a), a.organizationName && isStaff() ? h("small", { class: "muted block" }, a.organizationName) : null) },
       isRole("admin") ? { label: "IP", render: (a) => h("span", { class: "mono small" }, a.ip || "—") } : null,
-      { label: "Detail", render: (a) => (a.detail ? h("code", { class: "small" }, JSON.stringify(a.detail).slice(0, 120)) : "") },
     ].filter(Boolean),
     searchPlaceholder: null,
-    toolbar: [actor, button("Filter", () => { table.params.actor = actor.value; table.params.page = 1; return table.refresh(); }, { kind: "ghost small" }), button("Export CSV", () => download(`/api/audit/export.csv?${new URLSearchParams(Object.entries(table.params).filter(([, v]) => v))}`), { kind: "ghost small", iconName: "download" })],
-    filters: [{ name: "action", label: "Action", value: "", options: [["", "All actions"], ["login", "Sign-ins"], ["ticket", "Tickets"], ["payment", "Payments"], ["remote", "Remote sessions"], ["device", "Devices"], ["organization", "Organizations"], ["user", "Users"], ["invitation", "Invitations"], ["settings", "Settings"]] }],
+    toolbar: [actor, words, button("Filter", apply, { kind: "ghost small" }), button("Export CSV", () => download(`/api/audit/export.csv?${new URLSearchParams(Object.entries(table.params).filter(([, v]) => v))}`), { kind: "ghost small", iconName: "download" })],
+    filters: [{ name: "action", label: "Action", value: "", options: [["", "All actions"], ["login", "Sign-ins"], ["ticket", "Tickets"], ["payment", "Payments"], ["invoice", "Invoices"], ["subscription", "Subscriptions"], ["remote", "Remote sessions"], ["device", "Devices"], ["monitor", "Monitors"], ["incident", "Incidents"], ["organization", "Organizations"], ["user", "Users"], ["invitation", "Invitations"], ["settings", "Settings"], ["kb", "Help articles"]] }],
     load: (q) => api("GET", `/api/audit?${q}`),
     emptyText: "No audit events.",
   });
-  clear(main, pageHeader("Audit log", "Who did what and when. Entries cannot be edited."), table.el);
+  clear(main, pageHeader("Audit log", "Every change: who made it, what changed from and to, and the reason they gave. Entries cannot be edited or deleted."), table.el);
 }
 
 export async function settingsPage(main, query) {

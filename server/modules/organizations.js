@@ -1,5 +1,5 @@
 import { assertOrgAccess, isStaff, publicUser, requireRole, scopeOrgId } from "../auth.js";
-import { audit, transaction } from "../db.js";
+import { audit, changes, transaction } from "../db.js";
 import { HttpError } from "../errors.js";
 import { reply } from "../http.js";
 import { customerAdminIds, notifyUsers } from "../notify.js";
@@ -143,7 +143,9 @@ function update({ db, actor, params, body }) {
     if (meshGroupId && !/^[A-Za-z0-9/@$_.-]+$/.test(meshGroupId)) throw new HttpError(400, "The MeshCentral group id has unexpected characters.");
     db.prepare("UPDATE organizations SET mesh_group_id = ? WHERE id = ?").run(meshGroupId, org.id);
   }
-  audit(db, actor.id, "organization.update", "organization", org.id, org.id, null, actor.ip);
+  audit(db, actor.id, "organization.update", "organization", org.id, org.id, {
+    changes: changes(org, mustOrg(db, org.id), ["name", "contact_name", "contact_email", "contact_phone", "location", "timezone", "mesh_group_id"]),
+  }, actor.ip);
   return { organization: mapOrg(mustOrg(db, org.id), actor) };
 }
 
@@ -172,7 +174,8 @@ function setStatus(action) {
         db.prepare("UPDATE organizations SET status = 'active', suspended_at = NULL, suspension_reason = NULL, approved_at = COALESCE(approved_at, ?) WHERE id = ?").run(now, org.id);
         notifyUsers(db, customerAdminIds(db, org.id), { title: "Access restored", body: "Your organization's access to OSVIA Business Care is active again.", kind: "onboarding", link: "dashboard" });
       }
-      audit(db, actor.id, `organization.${action}`, "organization", org.id, org.id, body?.reason ? { reason: body.reason } : null, actor.ip);
+      const reason = action === "suspend" ? body.reason : nullableText(body?.reason, 300, "Reason");
+      audit(db, actor.id, `organization.${action}`, "organization", org.id, org.id, { reason, changes: { status: [org.status, action === "suspend" ? "suspended" : "active"] } }, actor.ip);
     });
     return { organization: mapOrg(mustOrg(db, org.id), actor) };
   };
@@ -224,6 +227,7 @@ function updateUser({ db, actor, params, body }) {
     role = assertEnum(body.role, allowed, "role");
   }
   const active = body.active === undefined ? target.active : (body.active ? 1 : 0);
+  const reason = role !== target.role || active !== target.active ? assertText(body.reason, "Reason for the change", 300) : null;
   transaction(db, () => {
     if (target.role === "admin" && (active === 0 || role !== "admin")) {
       const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = 1").get().n;
@@ -231,19 +235,20 @@ function updateUser({ db, actor, params, body }) {
     }
     db.prepare("UPDATE users SET role = ?, active = ? WHERE id = ?").run(role, active, target.id);
     if (active === 0 || role !== target.role) db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
-    audit(db, actor.id, "user.update", "user", target.id, target.organization_id, { role, active }, actor.ip);
+    audit(db, actor.id, "user.update", "user", target.id, target.organization_id, { changes: changes(target, { role, active }, ["role", "active"]), reason }, actor.ip);
   });
   return { user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(target.id)) };
 }
 
-function resetMfa({ db, actor, params }) {
+function resetMfa({ db, actor, params, body }) {
   requireRole(actor, "admin");
   const target = db.prepare("SELECT * FROM users WHERE id = ?").get(params.id);
   if (!target) throw new HttpError(404, "Not found.");
   if (target.id === actor.id) throw new HttpError(400, "Another administrator must reset your two-factor authentication.");
+  const reason = assertText(body?.reason, "Reason for the reset", 300);
   db.prepare("UPDATE users SET mfa_enabled = 0, mfa_secret = NULL WHERE id = ?").run(target.id);
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
-  audit(db, actor.id, "user.mfa_reset", "user", target.id, target.organization_id, null, actor.ip);
+  audit(db, actor.id, "user.mfa_reset", "user", target.id, target.organization_id, { reason }, actor.ip);
   return { ok: true };
 }
 

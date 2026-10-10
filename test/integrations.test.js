@@ -6,6 +6,7 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { backupDatabase, restoreBackup, verifyBackup } from "../server/backup.js";
 import { openDatabase, schemaVersion } from "../server/db.js";
+import { LATEST_VERSION } from "../server/migrations.js";
 import { autoCloseResolved, billingJobs, evaluateSla } from "../server/jobs.js";
 import { syncDevices } from "../server/meshcentral.js";
 import { recordMonitorResult, runDueMonitors } from "../server/monitoring.js";
@@ -108,9 +109,14 @@ describe("MeshCentral integration (fake meshctrl)", () => {
       if (args[0] === "listdevices") {
         const id = args[args.indexOf("--id") + 1];
         if (id === "mesh//groupA") console.log(JSON.stringify([
-          { _id: "node//one", name: "FRONT-DESK", osdesc: "Windows 11", conn: 1 },
+          { _id: "node//one", name: "FRONT-DESK", osdesc: "Windows 11", conn: 1, lat: 0.3476, long: 32.5825 },
           { _id: "node//two", name: "BACK-OFFICE", conn: 0 },
           { _id: "bogus", name: "ignored" }
+        ]));
+        else if (id === "mesh//groupB") console.log(JSON.stringify([
+          { _id: "node//gps", name: "FIELD-TABLET", conn: 1, gps: { latitude: 0.3136, longitude: 32.5811, accuracy: 18 } },
+          { _id: "node//wan", name: "BRANCH-PC", conn: 1, ip: "1.2.3.4", host: "192.168.1.50" },
+          { _id: "node//zero", name: "NO-FIX", conn: 1, lat: 0, lon: 0, ip: "10.0.0.8" }
         ]));
         else console.log("[]");
         process.exit(0);
@@ -133,9 +139,43 @@ describe("MeshCentral integration (fake meshctrl)", () => {
     assert.equal(result.created, 2);
     const devices = db.prepare("SELECT name, reachability, source, operating_system FROM devices ORDER BY name").all();
     assert.deepEqual(devices.map((d) => [d.name, d.reachability, d.source]), [["BACK-OFFICE", "offline", "meshcentral"], ["FRONT-DESK", "online", "meshcentral"]]);
+    const front = db.prepare("SELECT last_lat, last_lng, last_location_source FROM devices WHERE name = 'FRONT-DESK'").get();
+    assert.equal(front.last_location_source, "meshcentral");
+    assert.ok(Math.abs(front.last_lat - 0.3476) < 0.0001);
+    assert.equal(db.prepare("SELECT last_lat FROM devices WHERE name = 'BACK-OFFICE'").get().last_lat, null);
     const again = await syncDevices(db);
     assert.equal(again.updated, 2);
     assert.equal(again.created, 0);
+    db.close();
+  });
+
+  test("MeshCentral GPS and public IP are placed on the map automatically", async () => {
+    const db = openDatabase(":memory:");
+    const { org } = seed(db);
+    db.prepare("UPDATE organizations SET mesh_group_id = 'mesh//groupB' WHERE id = ?").run(org);
+    const lookups = [];
+    const result = await syncDevices(db, {
+      lookupFetch: async (url) => {
+        lookups.push(String(url));
+        if (String(url).includes("1.2.3.4")) {
+          return { ok: true, json: async () => ({ success: true, latitude: 0.3476, longitude: 32.5825, city: "Kampala", country: "Uganda" }) };
+        }
+        throw new Error(`unexpected lookup ${url}`);
+      },
+    });
+    assert.equal(result.status, "ok");
+    assert.equal(result.located, 2);
+    const tablet = db.prepare("SELECT last_lat, last_location_source, last_location_accuracy FROM devices WHERE name = 'FIELD-TABLET'").get();
+    assert.equal(tablet.last_location_source, "meshcentral");
+    assert.equal(tablet.last_location_accuracy, 18);
+    assert.ok(Math.abs(tablet.last_lat - 0.3136) < 0.0001);
+    const branch = db.prepare("SELECT last_location_source, last_seen_ip, address, last_location_label FROM devices WHERE name = 'BRANCH-PC'").get();
+    assert.equal(branch.last_location_source, "ip");
+    assert.equal(branch.last_seen_ip, "1.2.3.4");
+    assert.equal(branch.address, "1.2.3.4");
+    assert.match(branch.last_location_label, /Kampala/);
+    assert.ok(lookups.some((url) => url.includes("1.2.3.4")));
+    assert.equal(db.prepare("SELECT last_lat FROM devices WHERE name = 'NO-FIX'").get().last_lat, null);
     db.close();
   });
 
@@ -182,7 +222,7 @@ describe("migration from schema v2", () => {
     old.close();
 
     const db = openDatabase(file, { backupDir: backups });
-    assert.equal(schemaVersion(db), 3);
+    assert.equal(schemaVersion(db), LATEST_VERSION);
     assert.equal(db.prepare("SELECT role FROM users WHERE email = 'c@old.test'").get().role, "customer_admin");
     const tech = db.prepare("SELECT role, organization_id FROM users WHERE email = 't@old.test'").get();
     assert.deepEqual({ ...tech }, { role: "technician", organization_id: null });
@@ -211,7 +251,7 @@ describe("backup and restore", () => {
     assert.throws(() => restoreBackup(file, target, { key: "wrong-key" }));
     assert.ok(!fs.existsSync(target));
     const summary = restoreBackup(file, target, { key: "a-long-backup-passphrase" });
-    assert.equal(summary.version, 3);
+    assert.equal(summary.version, LATEST_VERSION);
     assert.equal(summary.counts.users, 2);
     assert.equal(verifyBackup(target).counts.organizations, 1);
   });

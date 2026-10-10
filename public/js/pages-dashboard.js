@@ -1,8 +1,9 @@
-import { api, badge, button, card, clear, empty, fmtRelative, h, icon, label, money, state, toast } from "./core.js";
+import { api, badge, button, card, clear, empty, errorBox, fmtDate, fmtDateTime, fmtRelative, h, icon, isRole, label, money, skeleton, state, toast } from "./core.js";
+import { actionText } from "./history.js";
 
 const STATUS_ORDER = ["new", "open", "in_progress", "pending_customer"];
 const PRIORITY_ORDER = ["urgent", "high", "normal", "low"];
-const HEALTH_NAMES = { meshcentral: "MeshCentral", smtp: "Email (SMTP)", monitor_runner: "Monitoring checks", scheduler: "Background jobs", backup: "Backups" };
+const HEALTH_NAMES = { meshcentral: "MeshCentral", smtp: "Email (SMTP)", monitor_runner: "Monitoring checks", device_runner: "Device checks", scheduler: "Background jobs", backup: "Backups" };
 
 function greeting() {
   const hour = Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: "Africa/Kampala" }).format(new Date()));
@@ -113,75 +114,45 @@ function healthList(health) {
     h("div", { class: "right" }, badge(item.status), item.checkedAt ? h("small", { class: "muted" }, fmtRelative(item.checkedAt)) : null))));
 }
 
-const ACTIONS = {
-  "admin.setup": "created the administrator account",
-  "login.succeeded": "signed in",
-  "login.failed": "had a failed sign-in",
-  "login.mfa_failed": "entered a wrong two-factor code",
-  "login.blocked_suspended": "was blocked from signing in (suspended)",
-  logout: "signed out",
-  "password.change": "changed their password",
-  "mfa.enable": "turned on two-factor authentication",
-  "mfa.disable": "turned off two-factor authentication",
-  "sessions.revoke": "signed out other sessions",
-  "user.update": "updated a user",
-  "user.mfa_reset": "reset a user's two-factor",
-  "invitation.create": "sent an invitation",
-  "invitation.accept": "accepted an invitation",
-  "invitation.revoke": "revoked an invitation",
-  "organization.create": "added an organization",
-  "organization.register": "registered an organization",
-  "organization.update": "updated an organization",
-  "ticket.create": "opened a ticket",
-  "ticket.update": "updated a ticket",
-  "attachment.upload": "attached a file",
-  "attachment.download": "downloaded an attachment",
-  "device.create": "added a device",
-  "device.update": "updated a device",
-  "device.archive": "archived a device",
-  "device.export": "exported the device list",
-  "device.consent": "gave remote-support consent",
-  "device.consent_revoke": "revoked remote-support consent",
-  "remote.launch": "started a remote session",
-  "maintenance.record": "recorded maintenance",
-  "maintenance.report": "downloaded a maintenance report",
-  "maintenance_schedule.create": "scheduled maintenance",
-  "maintenance_schedule.update": "updated a maintenance schedule",
-  "maintenance_schedule.complete": "completed scheduled maintenance",
-  "maintenance_window.create": "planned a maintenance window",
-  "maintenance_window.end": "ended a maintenance window",
-  "monitor.create": "added a monitor",
-  "monitor.update": "updated a monitor",
-  "monitor.pause": "paused a monitor",
-  "monitor.delete": "deleted a monitor",
-  "incident.create": "opened an incident",
-  "incident.update": "updated an incident",
-  "incident.resolve": "resolved an incident",
-  "plan.create": "created a service plan",
-  "plan.update": "updated a service plan",
-  "subscription.request": "requested a plan",
-  "subscription.update": "changed a subscription",
-  "invoice.create": "issued an invoice",
-  "invoice.void": "voided an invoice",
-  "payment.record": "recorded a payment",
-  "payment.verify": "verified a payment",
-  "payment.reject": "rejected a payment",
-  "sla_policy.create": "created an SLA policy",
-  "sla_policy.update": "updated an SLA policy",
-  "holiday.create": "added a holiday",
-  "holiday.delete": "removed a holiday",
-  "settings.update": "changed settings",
-  "backup.create": "created a backup",
-  "meshcentral.check": "checked MeshCentral",
-  "meshcentral.sync": "synchronized MeshCentral devices",
-};
-
 function activityFeed(items) {
   if (!items.length) return empty("No activity yet");
   return h("ul", { class: "activity" }, items.map((a) => h("li", {},
     h("span", { class: `activity-dot${/failed|blocked/.test(a.action) ? " bad" : ""}` }),
-    h("div", { class: "grow" }, h("span", {}, h("strong", {}, a.actorName), " ", ACTIONS[a.action] || a.action.replace(/[._]/g, " "), a.organizationName ? h("span", { class: "muted" }, ` · ${a.organizationName}`) : null),
+    h("div", { class: "grow" }, h("span", {}, h("strong", {}, a.actorName), " ", actionText(a.action), a.organizationName ? h("span", { class: "muted" }, ` · ${a.organizationName}`) : null),
       h("small", { class: "muted block" }, fmtRelative(a.at))))));
+}
+
+function deviceTile(dev) {
+  return h("a", { class: `device-tile ${dev.reachability}`, href: `#/devices/${dev.id}` },
+    h("div", { class: "device-tile-top" }, h("strong", {}, dev.name), badge(dev.reachability)),
+    h("small", { class: "muted block" }, [dev.organizationName, dev.assignedUserName].filter(Boolean).join(" · ") || "Unassigned"),
+    h("small", { class: "muted block" }, dev.lastChecked ? `Checked ${fmtRelative(dev.lastChecked)}` : "Not checked yet"),
+    dev.hasLocation ? h("small", { class: "muted block" }, "On the map") : null);
+}
+
+function dashboardMap(devices) {
+  if (!devices?.length) {
+    return empty("No devices on the map yet", "Open Map to read MeshCentral GPS and public IPs.");
+  }
+  const first = devices[0];
+  return h("div", { class: "dash-map" },
+    h("iframe", { class: "gmap", src: first.location.embedUrl, title: `Google Map of ${first.name}`, loading: "lazy", referrerpolicy: "origin", allow: "fullscreen" }),
+    h("div", { class: "fleet-meta" },
+      h("div", {}, h("strong", {}, first.name), h("small", { class: "muted block" }, first.location.label || first.organizationName)),
+      h("div", { class: "row-actions" },
+        h("a", { class: "btn small primary", href: first.location.mapsUrl, target: "_blank", rel: "noopener" }, "Open in Google Maps"),
+        h("a", { class: "btn small ghost", href: "#/map" }, "All devices"))),
+    h("ul", { class: "mini-list" }, devices.slice(0, 8).map((item) => h("li", {},
+      h("a", { href: `#/devices/${item.id}` }, item.name), badge(item.reachability),
+      h("a", { class: "small", href: item.location.mapsUrl, target: "_blank", rel: "noopener" }, "Google Maps")))));
+}
+
+function changeLine(c, staff) {
+  return h("li", {},
+    h("span", { class: `activity-dot ${c.status === "offline" ? "bad" : "ok"}` }),
+    h("div", { class: "grow" },
+      h("a", { href: `#/devices/${c.deviceId}` }, h("strong", {}, c.deviceName), ` ${c.status === "offline" ? "went offline" : "came online"}`, staff && c.organizationName ? h("span", { class: "muted" }, ` · ${c.organizationName}`) : null),
+      h("small", { class: "muted block" }, fmtRelative(c.at))));
 }
 
 export function staffDashboard(main, d, actions) {
@@ -195,6 +166,8 @@ export function staffDashboard(main, d, actions) {
       meter: d.devices.total ? (d.devices.online || 0) / d.devices.total : 0,
       hint: `${d.devices.offline || 0} offline · ${d.devices.unknown || 0} not checked`,
     }),
+    kpi("On the map", d.devices.onMap || 0, { iconName: "map", tone: d.devices.onMap ? "ok" : "warn", hint: d.devices.onMap ? "MeshCentral GPS or public IP" : "Open Map to detect devices", href: "#/map" }),
+    kpi("Remote ready", d.devices.remoteReady || 0, { iconName: "remote", tone: d.devices.remoteReady ? "ok" : "warn", hint: "Consented MeshCentral agents", href: "#/remote" }),
     kpi("Monitors up", d.monitors.total ? `${Math.max(0, monitorsUp)} / ${d.monitors.total}` : "—", {
       iconName: "pulse", tone: d.monitors.down ? "bad" : d.monitors.stale ? "warn" : "ok", href: "#/monitoring",
       meter: d.monitors.total ? Math.max(0, monitorsUp) / d.monitors.total : null,
@@ -212,12 +185,17 @@ export function staffDashboard(main, d, actions) {
     h("div", { class: "dash-hero" },
       h("div", {}, h("p", { class: "eyebrow" }, todayLine()), h("h1", {}, `Good ${greeting()}, ${state.me.name.split(" ")[0]}`),
         h("p", { class: "muted" }, admin ? "Here is what needs you across OSVIA Business Care today." : "Your queue and the systems you look after.")),
-      h("div", { class: "page-actions" }, button("Refresh", () => window.dispatchEvent(new HashChangeEvent("hashchange")), { kind: "ghost", iconName: "refresh" }), actions)),
+      h("div", { class: "page-actions" }, button("Refresh", () => loadDashboard(main), { kind: "ghost", iconName: "refresh" }), actions)),
     attentionCard(d, admin),
     kpis,
     h("div", { class: "dash-grid" },
       card("Ticket activity · last 14 days", trendChart(d.trend), { cls: "span-2" }),
       card("Open work", [breakdown("By status", d.byStatus, STATUS_ORDER, statusTones), breakdown("By priority", d.byPriority, PRIORITY_ORDER, priorityTones)])),
+    h("div", { class: "dash-grid" },
+      card("Devices right now", d.liveDevices?.length ? h("div", { class: "device-grid" }, d.liveDevices.map(deviceTile)) : empty("No devices yet"), { cls: "span-2", actions: h("span", { class: "row-actions" }, h("a", { href: "#/map", class: "link" }, "Map"), h("a", { href: "#/devices", class: "link" }, "All devices")) }),
+      card("Live map", dashboardMap(d.mapDevices), { actions: h("a", { href: "#/map", class: "link" }, "Open map") })),
+    h("div", { class: "dash-grid" },
+      card("Status changes", d.statusChanges?.length ? h("ul", { class: "activity" }, d.statusChanges.map((c) => changeLine(c, true))) : empty("No status changes yet. Checks run every 15 seconds."), { cls: "span-2" })),
     h("div", { class: "dash-grid" },
       card("Latest active tickets", ticketList(d.recentTickets), { cls: "span-2", actions: h("a", { href: "#/tickets", class: "link" }, "View all tickets") }),
       card("System health", healthList(d.health), { actions: admin ? h("a", { href: "#/settings?tab=system", class: "link" }, "Details") : null })),
@@ -276,4 +254,88 @@ export function securitySetupPage(main) {
       h("h1", {}, `Welcome, ${state.me.name.split(" ")[0]}. Secure your account first`),
       h("p", { class: "muted" }, "OSVIA staff accounts can reach every customer's tickets, devices and billing, so two-factor authentication is required before the dashboard opens. It takes about a minute."),
       card(null, [steps, area])));
+}
+
+function customerAttention(d) {
+  const items = [
+    [d.tickets.waitingOnYou, "Waiting on your reply", "warn", "#/tickets?status=pending_customer", "clock"],
+    [d.tickets.resolved, "Resolved — confirm they are fixed", "info", "#/tickets?status=resolved", "check"],
+    [d.devices.offline, "Devices offline", "bad", "#/devices?reachability=offline", "device"],
+    [d.incidentsOpen, "Open incidents", "bad", "#/status", "alert"],
+    [(d.monitors || []).filter((m) => m.status === "down").length, "Websites down", "bad", "#/status", "pulse"],
+  ];
+  if (d.billing) {
+    items.push(
+      [d.billing.overdue, "Overdue invoices", "bad", "#/billing", "money"],
+      [d.billing.unpaid, "Unpaid invoices", "warn", "#/billing", "money"],
+    );
+  }
+  return items.filter(([count]) => count > 0);
+}
+
+export function customerDashboard(main, d, actions) {
+  const org = d.organization;
+  const offline = d.devices.offline || 0;
+  const items = customerAttention(d);
+  const banners = [];
+  if (org.status === "pending") banners.push(h("div", { class: "banner warn" }, h("strong", {}, "OSVIA is reviewing your registration."), " You can explore the portal. Support requests open once your organization is approved."));
+  if (org.subscriptionStatus === "past_due") banners.push(h("div", { class: "banner bad" }, h("strong", {}, "Your renewal is overdue."), " Pay the open invoice to keep full service. ", isRole("customer_admin") ? h("a", { href: "#/billing" }, "View billing") : null));
+  if (d.onboardingIncomplete) banners.push(h("div", { class: "banner info" }, h("strong", {}, "Finish setting up."), " Follow the checklist to get full support. ", h("a", { href: "#/organization" }, "Open checklist")));
+  if (d.windows?.length) banners.push(...d.windows.map((w) => h("div", { class: "banner info" }, icon("calendar"), h("strong", {}, ` Planned maintenance: ${w.title}`), ` from ${fmtDateTime(w.startsAt)} to ${fmtDateTime(w.endsAt)}.`)));
+  const attention = items.length
+    ? h("section", { class: "attention", "aria-label": "Needs attention" }, h("h2", {}, "Needs attention"),
+      h("div", { class: "attention-list" }, items.map(([count, text, tone, href, iconName]) => h("a", { class: `attention-item ${tone}`, href }, icon(iconName), h("span", { class: "attention-count" }, count), h("span", {}, text)))))
+    : h("section", { class: "attention clear-state" }, h("span", { class: "kpi-icon ok" }, icon("check")), h("div", {}, h("strong", {}, "All clear"), h("p", { class: "muted small" }, "Your devices and websites are answering checks. Nothing is waiting on you.")));
+  clear(main,
+    h("div", { class: "dash-hero" },
+      h("div", {}, h("p", { class: "eyebrow" }, todayLine()), h("h1", {}, org.name),
+        h("p", { class: "muted" }, `${org.planName ? `${org.planName} plan` : "No plan yet"} · ${label(org.subscriptionStatus)}${org.renewalDate ? ` · renews ${fmtDate(org.renewalDate)}` : ""} · checks run every 15 seconds`)),
+      h("div", { class: "page-actions" }, button("Refresh", () => loadDashboard(main), { kind: "ghost", iconName: "refresh" }), org.status === "active" ? actions : [])),
+    banners,
+    attention,
+    h("div", { class: "kpis" },
+      kpi("Devices online", `${d.devices.online || 0} / ${d.devices.total || 0}`, {
+        iconName: "device", tone: offline ? "bad" : "ok", href: "#/devices",
+        meter: d.devices.total ? (d.devices.online || 0) / d.devices.total : 0,
+        hint: offline ? `${offline} offline now` : "All checked devices are answering",
+      }),
+      kpi("Open tickets", d.tickets.open, { iconName: "ticket", tone: d.tickets.waitingOnYou ? "warn" : "info", hint: `${d.tickets.waitingOnYou} waiting on you`, href: "#/tickets" }),
+      kpi("Websites", d.monitors?.length ? `${d.monitors.filter((m) => m.status === "up").length} / ${d.monitors.length} up` : "—", {
+        iconName: "pulse", tone: (d.monitors || []).some((m) => m.status === "down") ? "bad" : "ok", href: "#/status",
+        hint: d.monitors?.length ? "Last 24 hours" : "Add a website under Websites & status",
+      }),
+      kpi("Open incidents", d.incidentsOpen, { iconName: "alert", tone: d.incidentsOpen ? "bad" : "ok", href: "#/status" }),
+      d.billing ? kpi("Unpaid invoices", d.billing.unpaid, { iconName: "money", tone: d.billing.overdue ? "bad" : "", hint: d.billing.pending ? `${d.billing.pending} payment(s) being verified` : "", href: "#/billing" }) : null),
+    card(isRole("customer_user") ? "My devices" : "Your devices", d.liveDevices?.length ? h("div", { class: "device-grid" }, d.liveDevices.map(deviceTile)) : empty("No devices yet", isRole("customer_admin") ? "Add the computers OSVIA looks after so you can see when they go offline." : "Ask your administrator to assign devices to you."), { actions: h("a", { href: "#/devices", class: "link" }, "All devices") }),
+    d.monitors?.length ? card("Websites", h("div", { class: "site-grid" }, d.monitors.map((m) => h("a", { class: `site-card ${m.status}`, href: `#/monitoring/${m.id}` },
+      h("div", { class: "site-top" }, h("strong", {}, m.name), badge(m.status)),
+      h("div", { class: "site-stats" },
+        h("span", {}, h("strong", {}, m.uptimePercent === null ? "No data" : `${m.uptimePercent}%`), h("small", { class: "muted block" }, "uptime 24 h")),
+        h("span", {}, h("strong", {}, m.lastResponseMs != null ? `${m.lastResponseMs} ms` : "—"), h("small", { class: "muted block" }, "response")),
+        h("span", {}, h("strong", {}, m.lastCheckedAt ? fmtRelative(m.lastCheckedAt) : "never"), h("small", { class: "muted block" }, "last check")))))), { actions: h("a", { href: "#/status", class: "link" }, "Open status") }) : null,
+    h("div", { class: "dash-grid" },
+      card("Recent requests", ticketList(d.recentTickets), { cls: "span-2", actions: h("a", { href: "#/tickets", class: "link" }, "View all") }),
+      card("What just changed", d.statusChanges?.length ? h("ul", { class: "activity" }, d.statusChanges.map((c) => changeLine(c, false))) : empty("Waiting for the first check", "When a machine goes off or comes back on, it appears here immediately."))),
+    d.recentIncidents?.length ? card("Incidents", h("ul", { class: "mini-list" }, d.recentIncidents.map((i) => h("li", {}, h("a", { href: `#/incidents/${i.id}` }, h("span", { class: "grow" }, i.title), badge(i.status === "open" ? "down" : "resolved", i.status === "open" ? "Ongoing" : "Resolved"), h("small", { class: "muted" }, fmtRelative(i.startedAt))))))) : null,
+    d.upcomingMaintenance?.length ? card("Upcoming maintenance", h("ul", { class: "mini-list" }, d.upcomingMaintenance.map((m) => h("li", {}, h("span", { class: "grow" }, m.title), h("span", { class: "muted" }, fmtDate(m.nextDue)))))) : null,
+    state.config.escalation ? card("Urgent problem?", h("p", {}, state.config.escalation, state.config.supportPhone ? h("strong", {}, ` Support line: ${state.config.supportPhone}`) : null), { cls: "subtle" }) : null,
+  );
+}
+
+export async function loadDashboard(main) {
+  if (isRole("admin", "technician") && state.mustEnrollMfa) {
+    securitySetupPage(main);
+    return;
+  }
+  const actions = [button("New ticket", async () => {
+    const { newTicketDialog } = await import("./pages-main.js");
+    await newTicketDialog(() => loadDashboard(main));
+  }, { kind: "primary", iconName: "plus" })];
+  try {
+    const d = await api("GET", "/api/dashboard");
+    if (isRole("admin", "technician")) staffDashboard(main, d, actions);
+    else customerDashboard(main, d, actions);
+  } catch (error) {
+    clear(main, errorBox(error, () => loadDashboard(main)));
+  }
 }

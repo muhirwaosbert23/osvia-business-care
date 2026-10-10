@@ -30,7 +30,7 @@ initAppSecret(dataDir);
 const db = openDatabase(path.join(dataDir, "osvia.sqlite"), { backupDir });
 const server = createApp(db);
 server.headersTimeout = 20000;
-server.requestTimeout = 60000;
+server.requestTimeout = 0;
 
 server.on("error", (error) => {
   console.error(error.code === "EADDRINUSE" ? `Port ${port} is already in use.` : error);

@@ -582,6 +582,53 @@ function migrateV3(db, now) {
   seedV3(db, now);
 }
 
+const V4_TABLES = `
+CREATE TABLE device_status_events (
+  id INTEGER PRIMARY KEY,
+  device_id INTEGER NOT NULL REFERENCES devices(id),
+  status TEXT NOT NULL CHECK (status IN ('online', 'offline')),
+  previous_status TEXT,
+  source TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_device_status_events ON device_status_events(device_id, id);
+CREATE TABLE kb_articles (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  summary TEXT,
+  body TEXT NOT NULL,
+  audience TEXT NOT NULL DEFAULT 'customers' CHECK (audience IN ('customers', 'staff')),
+  published INTEGER NOT NULL DEFAULT 0,
+  views INTEGER NOT NULL DEFAULT 0,
+  helpful_yes INTEGER NOT NULL DEFAULT 0,
+  helpful_no INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER REFERENCES users(id),
+  updated_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE password_resets (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  ip TEXT,
+  created_at TEXT NOT NULL
+);
+`;
+
+function migrateV4(db) {
+  db.exec(V4_TABLES);
+  addColumn(db, "audit_events", "reason TEXT");
+  db.exec("CREATE INDEX idx_audit_entity ON audit_events(entity_type, entity_id, id)");
+  addColumn(db, "tickets", "csat_rating INTEGER");
+  addColumn(db, "tickets", "csat_comment TEXT");
+  addColumn(db, "tickets", "csat_at TEXT");
+  addColumn(db, "monitors", "created_by INTEGER REFERENCES users(id)");
+}
+
 export const MIGRATIONS = [
   {
     version: 1,
@@ -604,6 +651,62 @@ export const MIGRATIONS = [
     foreignKeysOff: true,
     up(db, now) {
       migrateV3(db, now);
+    },
+  },
+  {
+    version: 4,
+    up(db) {
+      migrateV4(db);
+    },
+  },
+  {
+    version: 5,
+    up(db) {
+      db.exec(`
+        CREATE TABLE location_events (
+          id INTEGER PRIMARY KEY,
+          device_id INTEGER NOT NULL REFERENCES devices(id),
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          accuracy_m INTEGER,
+          source TEXT NOT NULL CHECK (source IN ('manual', 'gps', 'ip', 'meshcentral')),
+          label TEXT,
+          ip TEXT,
+          created_by INTEGER REFERENCES users(id),
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_location_events ON location_events(device_id, id);
+      `);
+      addColumn(db, "devices", "last_lat REAL");
+      addColumn(db, "devices", "last_lng REAL");
+      addColumn(db, "devices", "last_location_at TEXT");
+      addColumn(db, "devices", "last_location_source TEXT");
+      addColumn(db, "devices", "last_location_label TEXT");
+      addColumn(db, "devices", "last_location_accuracy INTEGER");
+    },
+  },
+  {
+    version: 6,
+    up(db) {
+      addColumn(db, "devices", "last_seen_ip TEXT");
+      addColumn(db, "devices", "last_location_ip TEXT");
+    },
+  },
+  {
+    version: 7,
+    up(db) {
+      db.exec(`
+        CREATE TABLE device_findings (
+          id INTEGER PRIMARY KEY,
+          device_id INTEGER NOT NULL REFERENCES devices(id),
+          organization_id INTEGER NOT NULL REFERENCES organizations(id),
+          created_by INTEGER NOT NULL REFERENCES users(id),
+          kind TEXT NOT NULL CHECK (kind IN ('finding', 'next_step', 'note')),
+          body TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_device_findings ON device_findings(device_id, id);
+      `);
     },
   },
 ];

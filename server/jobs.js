@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { backupDatabase, pruneBackups } from "./backup.js";
 import { getSetting, setHealth, transaction } from "./db.js";
+import { refreshDeviceLocations } from "./location.js";
 import { meshConfigured, syncDevices } from "./meshcentral.js";
 import { meshIncidents, refreshDevices, runDueMonitors } from "./monitoring.js";
 import { customerAdminIds, deliverOutbox, notifyUsers, staffIds } from "./notify.js";
@@ -170,19 +171,23 @@ export function startScheduler(db, { backupDir }) {
     timers.push(timer);
   };
 
+  every("devices", 15000, async () => {
+    const n = await refreshDevices(db);
+    setHealth(db, "device_runner", "ok", `Checked ${n} device(s).`);
+  });
   every("scheduler", 60000, async () => {
-    await refreshDevices(db);
     await runDueMonitors(db);
     evaluateSla(db);
     setHealth(db, "scheduler", "ok", "Background checks ran.");
   });
   every("outbox", 30000, () => deliverOutbox(db));
-  every("hourly", 3600000, () => {
+  every("hourly", 3600000, async () => {
     autoCloseResolved(db);
     maintenanceReminders(db);
     billingJobs(db);
     monthlyReportNotices(db);
     pruneData(db);
+    await refreshDeviceLocations(db, { limit: 30 });
   });
   every("backup", 3600000, () => nightlyBackup(db, backupDir));
   if (meshConfigured()) {

@@ -1,4 +1,5 @@
 import { setHealth } from "./db.js";
+import { publish } from "./live.js";
 import { nowIso } from "./validate.js";
 
 const RETRY_MINUTES = [1, 5, 30, 120];
@@ -39,6 +40,7 @@ export function notifyUsers(db, userIds, { title, body, kind = "general", link =
     if (!user || user.active !== 1) continue;
     const result = insert.run(user.id, title, body, marker, kind, link, nowIso());
     if (marker && result.changes === 0) continue;
+    publish([user.id], "notification", { title, body, kind, link });
     if (email && user.email_notifications === 1) {
       const url = link ? `${appUrl()}/#/${link}` : appUrl();
       queueEmail(db, {
@@ -59,6 +61,10 @@ export function staffIds(db, roles = ["admin", "technician"]) {
 
 export function customerAdminIds(db, organizationId) {
   return db.prepare("SELECT id FROM users WHERE active = 1 AND organization_id = ? AND role = 'customer_admin'").all(organizationId).map((row) => row.id);
+}
+
+export function orgWatchers(db, organizationId, extraIds = []) {
+  return [...staffIds(db), ...customerAdminIds(db, organizationId), ...extraIds];
 }
 
 let cachedTransport = null;

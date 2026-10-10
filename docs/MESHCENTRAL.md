@@ -1,6 +1,6 @@
 # MeshCentral integration
 
-> **Status:** the integration has only been tested against a fake `meshctrl` script in `test/integrations.test.js`. It has **not** been verified against a live MeshCentral server. Check each step below on your own server before telling customers it works.
+> **Status:** verified on this office LAN against a live MeshCentral v1.2.5 server at `https://192.168.1.4:4430` (MeshCtrl `serverinfo`, device sync, and Desktop/Terminal/Files launch). Other sites still need their own MeshCentral URL and agent.
 
 ## What the portal does
 

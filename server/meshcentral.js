@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import { setHealth, transaction } from "./db.js";
+import { recordDeviceStatus, setHealth, transaction } from "./db.js";
 import { HttpError } from "./errors.js";
+import { nodeCoordinates, nodePublicIp } from "./geo.js";
+import { locateFromPublicIp, saveLocation, shouldApplyDetected } from "./location.js";
+import { announceDeviceStatus } from "./monitoring.js";
 import { nowIso } from "./validate.js";
 
 export function meshConfig() {
@@ -43,7 +46,14 @@ export function runMeshCtrl(command, extra = [], { timeoutMs = 25000, config = m
       reject(new Error("The MeshCentral credential file cannot be read."));
       return;
     }
-    const child = spawn(process.execPath, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ...(process.env.MESHCTRL_TLS_INSECURE === "true" ? { NODE_TLS_REJECT_UNAUTHORIZED: "0" } : {}),
+      },
+    });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -105,14 +115,16 @@ export async function checkHealth(db) {
   }
 }
 
-export async function syncDevices(db) {
+export async function syncDevices(db, { lookupFetch = fetch } = {}) {
   if (!meshConfigured()) {
     setHealth(db, "meshcentral", "not_configured", "MeshCentral is not configured, so no devices were synchronized.");
-    return { status: "not_configured", updated: 0, created: 0 };
+    return { status: "not_configured", updated: 0, created: 0, located: 0 };
   }
   const orgs = db.prepare("SELECT id, mesh_group_id FROM organizations WHERE mesh_group_id IS NOT NULL AND trim(mesh_group_id) != '' AND status != 'suspended'").all();
   let updated = 0;
   let created = 0;
+  let located = 0;
+  const pendingIp = [];
   const errors = [];
   for (const org of orgs) {
     let nodes;
@@ -123,39 +135,72 @@ export async function syncDevices(db) {
       continue;
     }
     const now = nowIso();
+    const changes = [];
     transaction(db, () => {
       for (const node of nodes) {
         if (!node || typeof node._id !== "string" || !node._id.startsWith("node/")) continue;
         const conn = Number.isInteger(node.conn) ? node.conn : 0;
         const name = String(node.name || node.rname || "Unnamed device").slice(0, 120);
         const os = node.osdesc ? String(node.osdesc).slice(0, 120) : null;
-        const existing = db.prepare("SELECT id, organization_id, reachability FROM devices WHERE mesh_node_id = ?").get(node._id);
+        const existing = db.prepare("SELECT * FROM devices WHERE mesh_node_id = ?").get(node._id);
         if (existing && existing.organization_id !== org.id) {
           errors.push(`Device ${name} is mapped to another organization and was not moved.`);
           continue;
         }
         const reachability = conn > 0 ? "online" : "offline";
+        let deviceId;
         if (existing) {
           db.prepare(`
             UPDATE devices SET name = ?, operating_system = COALESCE(?, operating_system), mesh_conn = ?, reachability = ?,
               last_checked = ?, last_connection = CASE WHEN ? > 0 THEN ? ELSE last_connection END, mesh_synced_at = ?, source = 'meshcentral', management_status = 'agent_installed', updated_at = ?
             WHERE id = ?
           `).run(name, os, conn, reachability, now, conn, now, now, now, existing.id);
+          recordDeviceStatus(db, existing.id, existing.reachability, reachability, "meshcentral", now);
+          if (existing.reachability !== reachability) changes.push({ device: { ...existing, name }, previous: existing.reachability, status: reachability });
           updated += 1;
+          deviceId = existing.id;
         } else {
-          db.prepare(`
+          const info = db.prepare(`
             INSERT INTO devices (organization_id, name, operating_system, source, mesh_node_id, mesh_conn, reachability, last_checked,
               last_connection, mesh_synced_at, management_status, created_at, updated_at)
             VALUES (?, ?, ?, 'meshcentral', ?, ?, ?, ?, ?, ?, 'agent_installed', ?, ?)
           `).run(org.id, name, os, node._id, conn, reachability, now, conn > 0 ? now : null, now, now, now);
+          const createdDevice = { id: Number(info.lastInsertRowid), organization_id: org.id, name, assigned_user_id: null, last_connection: conn > 0 ? now : null };
+          recordDeviceStatus(db, createdDevice.id, null, reachability, "meshcentral", now);
+          changes.push({ device: createdDevice, previous: null, status: reachability });
           created += 1;
+          deviceId = createdDevice.id;
+        }
+        const device = db.prepare("SELECT * FROM devices WHERE id = ?").get(deviceId);
+        const ip = nodePublicIp(node);
+        if (ip) {
+          db.prepare("UPDATE devices SET last_seen_ip = ?, address = COALESCE(NULLIF(address, ''), ?) WHERE id = ?").run(ip, ip, deviceId);
+          device.last_seen_ip = ip;
+          device.address = device.address || ip;
+        }
+        const coords = nodeCoordinates(node);
+        if (coords && shouldApplyDetected(device, coords)) {
+          saveLocation(db, device, coords);
+          located += 1;
+        } else if (ip) {
+          pendingIp.push({ deviceId, ip });
         }
       }
     });
+    for (const change of changes) announceDeviceStatus(db, change.device, change.previous, change.status, now);
+  }
+  for (const item of pendingIp) {
+    const device = db.prepare("SELECT * FROM devices WHERE id = ?").get(item.deviceId);
+    try {
+      const saved = await locateFromPublicIp(db, device, item.ip, lookupFetch);
+      if (saved) located += 1;
+    } catch {
+      /* public-IP lookup is best-effort during sync */
+    }
   }
   const status = errors.length ? "error" : "ok";
-  setHealth(db, "meshcentral", status, errors.length ? errors.slice(0, 3).join(" ") : `Synchronized ${orgs.length} organization group(s): ${created} new, ${updated} updated.`);
-  return { status, updated, created, errors };
+  setHealth(db, "meshcentral", status, errors.length ? errors.slice(0, 3).join(" ") : `Synchronized ${orgs.length} organization group(s): ${created} new, ${updated} updated, ${located} placed on the map.`);
+  return { status, updated, created, located, errors };
 }
 
 export function remoteLaunchUrl(device, mode) {

@@ -1,8 +1,8 @@
-import { isStaff, requireStaff, scopeOrgId } from "../auth.js";
-import { audit, transaction } from "../db.js";
+import { isStaff, rateLimit, requireOperationalOrg, requireRole, requireStaff, scopeOrgId } from "../auth.js";
+import { audit, changes, transaction } from "../db.js";
 import { HttpError } from "../errors.js";
 import { reply } from "../http.js";
-import { assertMonitorTarget, checkMonitor, monitorFreshness, recordMonitorResult } from "../monitoring.js";
+import { assertMonitorTarget, assertPublicUrl, checkMonitor, monitorFreshness, PUBLIC_ONLY_SQL, recordMonitorResult } from "../monitoring.js";
 import { customerAdminIds, notifyUsers, staffIds } from "../notify.js";
 import { assertBool, assertDateTime, assertEnum, assertInt, assertText, fieldPicker, nowIso, nullableText, pageParams } from "../validate.js";
 import { mustOrg } from "./organizations.js";
@@ -20,7 +20,11 @@ function mapMonitor(row, actor, stats = null) {
     sslExpiresAt: row.ssl_expires_at,
     active: row.active === 1,
     intervalSeconds: row.interval_seconds,
+    addedByCustomer: row.public_only === 1,
+    createdByName: row.created_by_name || "",
+    canManage: canManage(actor, row),
   };
+  if (data.canManage && data.addedByCustomer) data.target = row.target;
   if (stats) Object.assign(data, stats);
   if (isStaff(actor)) {
     Object.assign(data, {
@@ -57,7 +61,13 @@ function scope(actor, url, alias = "m") {
   return { sql: where.length ? where.join(" AND ") : "1 = 1", args };
 }
 
-const MONITOR_SELECT = "SELECT m.*, o.name AS organization_name FROM monitors m JOIN organizations o ON o.id = m.organization_id";
+const MONITOR_SELECT = `SELECT m.*, o.name AS organization_name, ${PUBLIC_ONLY_SQL} AS public_only, cu.name AS created_by_name FROM monitors m JOIN organizations o ON o.id = m.organization_id LEFT JOIN users cu ON cu.id = m.created_by`;
+const CUSTOMER_DEFAULT_MONITORS = 5;
+
+function canManage(actor, row) {
+  if (isStaff(actor)) return true;
+  return actor.role === "customer_admin" && row.organization_id === actor.organizationId && row.public_only === 1;
+}
 
 function loadMonitor(db, actor, id) {
   const s = scope(actor, null);
@@ -83,7 +93,36 @@ function get({ db, actor, params }) {
     statusCode: c.status_code,
     error: isStaff(actor) ? c.error : (c.ok ? null : "Check failed"),
   }));
-  return { monitor: mapMonitor(row, actor), day: uptime(db, row.id, 24), week: uptime(db, row.id, 24 * 7), month: uptime(db, row.id, 24 * 30), checks };
+  const since = new Date(Date.now() - 89 * 86400000).toISOString().slice(0, 10);
+  const byDay = Object.fromEntries(db.prepare(`
+    SELECT substr(checked_at, 1, 10) AS day, COUNT(*) AS total, SUM(ok) AS up, AVG(CASE WHEN ok = 1 THEN response_ms END) AS avg_ms
+    FROM monitor_checks WHERE monitor_id = ? AND checked_at >= ? GROUP BY day
+  `).all(row.id, since).map((d) => [d.day, d]));
+  const daily = Array.from({ length: 90 }, (_, i) => {
+    const day = new Date(Date.parse(`${since}T00:00:00Z`) + i * 86400000).toISOString().slice(0, 10);
+    const d = byDay[day];
+    return { day, checks: d?.total || 0, uptimePercent: d ? Math.round((d.up / d.total) * 10000) / 100 : null, avgResponseMs: d?.avg_ms ? Math.round(d.avg_ms) : null };
+  });
+  return { monitor: mapMonitor(row, actor), day: uptime(db, row.id, 24), week: uptime(db, row.id, 24 * 7), month: uptime(db, row.id, 24 * 30), quarter: uptime(db, row.id, 24 * 90), checks, daily };
+}
+
+async function customerFields(body, current = {}) {
+  const pick = fieldPicker(body, current);
+  const raw = body.target === undefined ? current.target : body.target;
+  const target = await assertPublicUrl(assertMonitorTarget("http", raw));
+  return {
+    name: pick("name", "name", (v) => assertText(v, "Website name", 120)),
+    type: "http",
+    target,
+    port: null,
+    interval_seconds: pick("intervalSeconds", "interval_seconds", (v) => assertInt(v, "Check interval (seconds)", 300, 86400), 300),
+    timeout_ms: current.timeout_ms ?? 10000,
+    failure_threshold: current.failure_threshold ?? 2,
+    expected_status: current.expected_status ?? "200-399",
+    ssl_warning_days: current.ssl_warning_days ?? 14,
+    customer_visible: 1,
+    active: pick("active", "active", assertBool, 1),
+  };
 }
 
 function fields(body, current = {}) {
@@ -111,29 +150,41 @@ function fields(body, current = {}) {
   };
 }
 
-function create({ db, actor, body }) {
-  requireStaff(actor);
+async function create({ db, actor, body }) {
+  const staff = isStaff(actor);
+  if (!staff) {
+    requireRole(actor, "customer_admin");
+    requireOperationalOrg(db, actor);
+    rateLimit(db, `monitor-create:${actor.id}`, 20, 60, "Too many websites added in the last hour. Try again later.");
+  }
   const organizationId = scopeOrgId(actor, body.organizationId);
   const org = mustOrg(db, organizationId);
-  if (org.monitor_limit && org.subscription_status === "active") {
-    const count = db.prepare("SELECT COUNT(*) AS n FROM monitors WHERE organization_id = ?").get(organizationId).n;
-    if (count >= org.monitor_limit && actor.role !== "admin") throw new HttpError(400, `This plan covers ${org.monitor_limit} monitors. An administrator can add more.`);
+  const count = db.prepare("SELECT COUNT(*) AS n FROM monitors WHERE organization_id = ?").get(organizationId).n;
+  if (staff && org.monitor_limit && org.subscription_status === "active" && count >= org.monitor_limit && actor.role !== "admin") {
+    throw new HttpError(400, `This plan covers ${org.monitor_limit} monitors. An administrator can add more.`);
   }
-  const f = fields(body);
+  if (!staff) {
+    const limit = org.monitor_limit || CUSTOMER_DEFAULT_MONITORS;
+    if (count >= limit) throw new HttpError(400, `Your plan covers ${limit} monitored websites. Contact OSVIA to add more.`);
+  }
+  const f = staff ? fields(body) : await customerFields(body);
   const keys = Object.keys(f);
-  const info = db.prepare(`INSERT INTO monitors (organization_id, ${keys.join(", ")}, created_at) VALUES (?, ${keys.map(() => "?").join(", ")}, ?)`).run(organizationId, ...keys.map((k) => f[k]), nowIso());
-  audit(db, actor.id, "monitor.create", "monitor", info.lastInsertRowid, organizationId, { type: f.type }, actor.ip);
+  const info = db.prepare(`INSERT INTO monitors (organization_id, ${keys.join(", ")}, created_by, created_at) VALUES (?, ${keys.map(() => "?").join(", ")}, ?, ?)`).run(organizationId, ...keys.map((k) => f[k]), actor.id, nowIso());
+  audit(db, actor.id, "monitor.create", "monitor", info.lastInsertRowid, organizationId, { type: f.type, target: f.target }, actor.ip);
+  if (!staff) {
+    notifyUsers(db, staffIds(db), { title: `${org.name} added a website to monitor`, body: `${f.name}: ${f.target}`, kind: "monitor", link: `monitoring/${info.lastInsertRowid}`, email: false });
+  }
   return reply(201, { monitor: mapMonitor(loadMonitor(db, actor, Number(info.lastInsertRowid)), actor) });
 }
 
-function update({ db, actor, params, body }) {
-  requireStaff(actor);
+async function update({ db, actor, params, body }) {
   const row = loadMonitor(db, actor, params.id);
-  const f = fields(body, row);
+  if (!canManage(actor, row)) throw new HttpError(403, "OSVIA manages this monitor. Open a ticket to change it.");
+  const f = row.public_only ? await customerFields(body, row) : fields(body, row);
   const keys = Object.keys(f);
   const reset = f.target !== row.target || f.type !== row.type || f.port !== row.port;
   db.prepare(`UPDATE monitors SET ${keys.map((k) => `${k} = ?`).join(", ")}${reset ? ", status = 'unknown', consecutive_failures = 0, ssl_expires_at = NULL" : ""} WHERE id = ?`).run(...keys.map((k) => f[k]), row.id);
-  audit(db, actor.id, "monitor.update", "monitor", row.id, row.organization_id, null, actor.ip);
+  audit(db, actor.id, "monitor.update", "monitor", row.id, row.organization_id, { changes: changes(row, f, keys), reason: nullableText(body.reason, 300, "Reason") }, actor.ip);
   return { monitor: mapMonitor(loadMonitor(db, actor, row.id), actor) };
 }
 
@@ -145,8 +196,8 @@ async function runNow({ db, actor, params }) {
 }
 
 function remove({ db, actor, params }) {
-  requireStaff(actor);
   const row = loadMonitor(db, actor, params.id);
+  if (!canManage(actor, row)) throw new HttpError(403, "OSVIA manages this monitor. Open a ticket to change it.");
   const history = db.prepare("SELECT COUNT(*) AS n FROM incidents WHERE monitor_id = ?").get(row.id).n;
   if (history) {
     db.prepare("UPDATE monitors SET active = 0 WHERE id = ?").run(row.id);
@@ -255,7 +306,9 @@ function updateIncident({ db, actor, params, body }) {
     db.prepare("UPDATE incidents SET summary = ?, severity = ?, customer_visible = ?, status = ?, resolved_at = ? WHERE id = ?").run(
       summary, severity, visible, resolve ? "resolved" : row.status, resolve ? nowIso() : row.resolved_at, row.id,
     );
-    audit(db, actor.id, resolve ? "incident.resolve" : "incident.update", "incident", row.id, row.organization_id, null, actor.ip);
+    audit(db, actor.id, resolve ? "incident.resolve" : "incident.update", "incident", row.id, row.organization_id, {
+      changes: changes(row, { ...row, summary, severity, customer_visible: visible, status: resolve ? "resolved" : row.status }, ["status", "severity", "customer_visible", "summary"]),
+    }, actor.ip);
     if (resolve) {
       const recipients = staffIds(db);
       if (visible) recipients.push(...customerAdminIds(db, row.organization_id));

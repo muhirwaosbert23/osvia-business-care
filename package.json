@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node --experimental-sqlite --no-warnings=ExperimentalWarning server/index.js",
-    "test": "node --experimental-sqlite --no-warnings=ExperimentalWarning --test --test-concurrency=1 test/sla.test.js test/integrations.test.js test/workflows.test.js",
+    "test": "node --experimental-sqlite --no-warnings=ExperimentalWarning --test --test-concurrency=1 test/sla.test.js test/integrations.test.js test/workflows.test.js test/history.test.js test/availability.test.js test/live.test.js test/location.test.js test/troubleshoot.test.js",
     "backup": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/backup.js",
     "restore": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/restore.js",
     "migrate:check": "node --experimental-sqlite --no-warnings=ExperimentalWarning scripts/migrate-check.js",

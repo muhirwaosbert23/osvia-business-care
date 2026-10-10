@@ -114,6 +114,7 @@ const ICONS = {
   clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M12 7v5l3 2",
   activity: "M22 12h-4l-3 9L9 3l-3 9H2",
   smartphone: "M7 2h10v20H7zM11 18h2",
+  map: "M9 3 3 5v16l6-2 6 2 6-2V3l-6 2-6-2zm0 0v16m6-14v16",
 };
 
 export function icon(name, cls = "icon") {

@@ -62,19 +62,42 @@ export function transaction(db, fn) {
 }
 
 export function audit(db, actorId, action, entityType, entityId, organizationId, detail, ip = null) {
+  const { reason = null, ...rest } = detail || {};
+  const cleaned = Object.fromEntries(Object.entries(rest).filter(([, value]) => value !== undefined));
   db.prepare(`
-    INSERT INTO audit_events (actor_id, action, entity_type, entity_id, organization_id, detail, ip, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO audit_events (actor_id, action, entity_type, entity_id, organization_id, detail, reason, ip, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     actorId ?? null,
     action,
     entityType,
     entityId == null ? null : String(entityId),
     organizationId ?? null,
-    detail ? JSON.stringify(detail) : null,
+    Object.keys(cleaned).length ? JSON.stringify(cleaned) : null,
+    reason ? String(reason).slice(0, 500) : null,
     ip,
     nowIso(),
   );
+}
+
+// Returns { column: [before, after] } for the listed columns that changed, or undefined when nothing changed.
+export function changes(before, after, columns) {
+  const out = {};
+  for (const column of columns) {
+    const from = before?.[column] ?? null;
+    const to = after?.[column] ?? null;
+    if (String(from) === String(to)) continue;
+    const short = (value) => (typeof value === "string" && value.length > 200 ? `${value.slice(0, 200)}…` : value);
+    out[column] = [short(from), short(to)];
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+// Stores a reachability change measured by a real check or agent report. Unchanged results are not stored.
+export function recordDeviceStatus(db, deviceId, previous, status, source, at = nowIso()) {
+  if (!["online", "offline"].includes(status) || previous === status) return false;
+  db.prepare("INSERT INTO device_status_events (device_id, status, previous_status, source, created_at) VALUES (?, ?, ?, ?, ?)").run(deviceId, status, previous ?? null, source, at);
+  return true;
 }
 
 export function getSetting(db, key, fallback = "") {

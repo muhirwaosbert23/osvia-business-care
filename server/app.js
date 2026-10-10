@@ -7,6 +7,8 @@ import { readJson, readRaw, Reply, sameOrigin, sendJson, serveStatic } from "./h
 import { routes as adminRoutes } from "./modules/admin.js";
 import { routes as billingRoutes } from "./modules/billing.js";
 import { routes as deviceRoutes } from "./modules/devices.js";
+import { routes as historyRoutes } from "./modules/history.js";
+import { routes as liveRoutes } from "./live.js";
 import { routes as maintenanceRoutes } from "./modules/maintenance.js";
 import { routes as monitoringRoutes } from "./modules/monitors.js";
 import { routes as organizationRoutes } from "./modules/organizations.js";
@@ -70,6 +72,8 @@ const ROUTES = compile([
   ...reportRoutes,
   ...slaRoutes,
   ...adminRoutes,
+  ...historyRoutes,
+  ...liveRoutes,
 ]);
 
 function match(method, pathname) {
@@ -104,6 +108,12 @@ async function dispatch(db, req, res, services) {
   const unsafe = method !== "GET" && method !== "HEAD";
   if (unsafe && !sameOrigin(req)) throw new HttpError(403, "Cross-site requests are not allowed.");
 
+  if (route.options.stream) {
+    req.setTimeout(0);
+    res.setTimeout(0);
+  } else {
+    req.setTimeout(30000);
+  }
   const ctx = { db, req, res, url, params, services, body: null, raw: null, actor: null };
   if (!route.options.public) {
     ctx.actor = auth.loadSession(db, req);
@@ -125,7 +135,6 @@ async function dispatch(db, req, res, services) {
 
 export function createApp(db, services = {}) {
   return http.createServer((req, res) => {
-    req.setTimeout(30000);
     dispatch(db, req, res, services).catch((error) => {
       if (res.headersSent) {
         res.destroy();

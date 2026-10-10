@@ -3,12 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { isStaff, requireOperationalOrg, requireStaff, scopeOrgId } from "../auth.js";
 import { ACTIVE_TICKET_STATUSES, CATEGORIES, IMPACTS, PRIORITIES, STAFF_TRANSITIONS, TICKET_STATUSES } from "../constants.js";
-import { audit, getSetting, transaction } from "../db.js";
+import { audit, changes as diff, getSetting, transaction } from "../db.js";
 import { HttpError } from "../errors.js";
 import { reply, sendFile } from "../http.js";
 import { notifyUsers, staffIds } from "../notify.js";
 import { addBusinessMinutes, businessMinutesBetween, deadlinesFor, findPolicy, loadHolidays, slaState } from "../sla.js";
-import { assertEnum, assertId, assertInt, assertText, likePattern, nowIso, optionalText, pageParams } from "../validate.js";
+import { assertEnum, assertId, assertInt, assertText, likePattern, nowIso, nullableText, optionalText, pageParams } from "../validate.js";
 import { mustOrg } from "./organizations.js";
 
 const MAX_UPLOAD = 5 * 1024 * 1024;
@@ -293,7 +293,10 @@ function update({ db, actor, params, body }) {
     if (statusChanged) recordEvent(db, ticket.id, actor.id, ticket.status, updates.status, changes.filter((c) => !c.startsWith("internal:")).join(". ") || null);
     else if (changes.length) recordEvent(db, ticket.id, actor.id, ticket.status, ticket.status, changes.join(". "));
     refreshBreaches(db, ticket.id);
-    audit(db, actor.id, "ticket.update", "ticket", ticket.id, ticket.organization_id, { ...updates, resolution_summary: undefined }, actor.ip);
+    audit(db, actor.id, "ticket.update", "ticket", ticket.id, ticket.organization_id, {
+      changes: diff(ticket, { ...ticket, ...updates }, ["status", "priority", "category", "impact", "assigned_to", "device_id", "resolution_summary", "response_due_at", "resolution_due_at"]),
+      reason: nullableText(body.reason, 300, "Reason"),
+    }, actor.ip);
     if (statusChanged) {
       notifyUsers(db, [ticket.created_by], {
         title: `${ticket.number} is ${updates.status.replaceAll("_", " ")}`,
