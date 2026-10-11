@@ -13,6 +13,7 @@ import { routes as maintenanceRoutes } from "./modules/maintenance.js";
 import { routes as monitoringRoutes } from "./modules/monitors.js";
 import { routes as organizationRoutes } from "./modules/organizations.js";
 import { routes as reportRoutes } from "./modules/reports.js";
+import { routes as searchRoutes } from "./modules/search.js";
 import { routes as slaRoutes } from "./modules/sla-admin.js";
 import { routes as ticketRoutes } from "./modules/tickets.js";
 import { getSetting } from "./db.js";
@@ -74,6 +75,7 @@ const ROUTES = compile([
   ...adminRoutes,
   ...historyRoutes,
   ...liveRoutes,
+  ...searchRoutes,
 ]);
 
 function match(method, pathname) {
@@ -119,7 +121,7 @@ async function dispatch(db, req, res, services) {
     ctx.actor = auth.loadSession(db, req);
     if (!ctx.actor) throw new HttpError(401, "Sign in required.");
     if (unsafe && !auth.tokensMatchCsrf(req, ctx.actor)) throw new HttpError(403, "Your session token is missing. Refresh the page and try again.");
-    if (!route.options.mfaExempt && auth.mustEnrollMfa(ctx.actor)) {
+    if (!route.options.mfaExempt && auth.mustEnrollMfa(ctx.actor, db)) {
       throw new HttpError(403, "Turn on two-factor authentication under Account before using staff tools.");
     }
   }

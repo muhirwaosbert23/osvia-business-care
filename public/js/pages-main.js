@@ -1,5 +1,5 @@
 import {
-  api, badge, button, card, CATEGORIES, clear, dataTable, definitionList, download, empty, enumOptions, errorBox, fmtDate, fmtDateTime, fmtRelative,
+  api, badge, button, card, CATEGORIES, clear, copyLinkButton, dataTable, definitionList, download, empty, enumOptions, errorBox, fmtDate, fmtDateTime, fmtRelative,
   formDialog, h, icon, IMPACTS, isRole, isStaff, label, orgOptions, pageHeader, PRIORITIES, skeleton, staffOptions, stat, state, toast,
 } from "./core.js";
 import { historyCard } from "./history.js";
@@ -147,7 +147,7 @@ function render(main, data) {
 
   clear(main,
     h("a", { href: "#/tickets", class: "back" }, "← All tickets"),
-    pageHeader(t.title, null, [badge(t.priority), badge(t.status)]),
+    pageHeader(t.title, null, [copyLinkButton(), badge(t.priority), badge(t.status)]),
     h("p", { class: "muted mono" }, t.number),
     h("div", { class: "detail" },
       h("div", { class: "detail-main" },
@@ -162,16 +162,28 @@ function render(main, data) {
 function replyForm(t, reload) {
   const staff = isStaff();
   const text = h("textarea", { rows: 4, maxlength: 8000, "aria-label": "Message", placeholder: staff ? "Write a reply to the customer, or an internal note" : "Write a reply to OSVIA" });
+  const draftKey = `osvia-draft:${state.me.id}:${t.id}`;
+  const restored = localStorage.getItem(draftKey) || "";
+  if (restored) text.value = restored;
+  let draftTimer = null;
+  text.addEventListener("input", () => {
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(() => {
+      if (text.value.trim()) localStorage.setItem(draftKey, text.value);
+      else localStorage.removeItem(draftKey);
+    }, 250);
+  });
   const kind = staff ? h("select", { "aria-label": "Entry type", onchange: () => minutes.classList.toggle("hidden", kind.value !== "work_log") },
     h("option", { value: "reply" }, "Reply to customer"), h("option", { value: "note" }, "Internal note"), h("option", { value: "work_log" }, "Work log (internal)")) : null;
   const minutes = h("input", { type: "number", min: 1, max: 1440, class: "hidden narrow", placeholder: "Minutes", "aria-label": "Minutes spent" });
   const send = button("Send", async () => {
     if (!text.value.trim()) throw new Error("Write a message first.");
     await api("POST", `/api/tickets/${t.id}/notes`, { body: text.value, kind: kind?.value || "reply", minutesSpent: minutes.value ? Number(minutes.value) : undefined });
+    localStorage.removeItem(draftKey);
     toast(kind?.value === "reply" || !kind ? "Reply sent." : "Saved.");
     await reload();
   }, { kind: "primary" });
-  return h("div", { class: "reply" }, text, h("div", { class: "row" }, kind, minutes, h("div", { class: "spacer" }), send),
+  return h("div", { class: "reply" }, text, restored ? h("p", { class: "small muted" }, "Unsent reply restored on this browser.") : null, h("div", { class: "row" }, kind, minutes, h("div", { class: "spacer" }), send),
     !staff && t.status === "pending_customer" ? h("p", { class: "small muted" }, "Replying moves the ticket back to OSVIA and resumes the service-level clock.") : null);
 }
 

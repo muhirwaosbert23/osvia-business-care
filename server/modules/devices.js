@@ -339,7 +339,7 @@ async function checkNow({ db, actor, params }) {
 
 function remote({ db, actor, params, body }) {
   requireStaff(actor);
-  requireMfa(actor);
+  requireMfa(actor, db);
   const row = loadDevice(db, actor, params.id);
   if (row.organization_status !== "active") throw new HttpError(403, "Remote support is unavailable while the organization is not active.");
   if (!row.mesh_node_id) throw new HttpError(400, "This device is not linked to a MeshCentral agent.");

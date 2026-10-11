@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { isStaff, requireRole, requireStaff } from "../auth.js";
+import { isStaff, requireRole, requireStaff, staffMfaRequired } from "../auth.js";
 import { backupDatabase, pruneBackups } from "../backup.js";
 import { streamCsv } from "../csv.js";
 import { audit, schemaVersion } from "../db.js";
@@ -321,6 +321,11 @@ const EDITABLE_SETTINGS = {
   reopen_days: (v) => String(assertInt(v, "Reopen window (days)", 1, 90)),
   auto_close_days: (v) => String(assertInt(v, "Auto-close after (days)", 1, 60)),
   escalation_text: (v) => assertText(v, "Escalation guidance", 1000),
+  staff_mfa_required: (v) => {
+    if (v === true || v === 1 || v === "1" || v === "true" || v === "on") return "1";
+    if (v === false || v === 0 || v === "0" || v === "false" || v === "" || v === "off") return "0";
+    throw new HttpError(400, "Choose whether the extra sign-in check is required.");
+  },
 };
 
 function getSettings({ db, actor }) {
@@ -350,7 +355,7 @@ function system({ db, actor }) {
     schemaVersion: schemaVersion(db),
     meshConfigured: meshConfigured(),
     smtpConfigured: smtpConfigured(),
-    staffMfaRequired: process.env.REQUIRE_STAFF_MFA !== "false",
+    staffMfaRequired: staffMfaRequired(db),
     backupEncrypted: Boolean(process.env.BACKUP_KEY),
     outbox: Object.fromEntries(outbox.map((r) => [r.status, r.n])),
     recentEmailErrors: actor.role === "admin" ? db.prepare("SELECT id, to_email, subject, attempts, last_error, created_at FROM email_outbox WHERE status = 'failed' ORDER BY id DESC LIMIT 10").all() : [],

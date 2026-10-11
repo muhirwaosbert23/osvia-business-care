@@ -55,6 +55,20 @@ describe("authentication", () => {
     assert.equal((await client.get("/api/dashboard")).status, 200);
   });
 
+  test("admin can turn off the extra sign-in check and sign in with password only", async () => {
+    const off = await ctx.admin.patch("/api/settings", { staff_mfa_required: "0" });
+    assert.equal(off.status, 200);
+    const client = new Client(env.base);
+    const first = await client.post("/api/login", { email: "admin@osvia.test", password: PASSWORD });
+    assert.equal(first.status, 200);
+    assert.equal(first.data.mfaRequired, undefined);
+    assert.equal((await client.get("/api/dashboard")).status, 200);
+    const on = await client.patch("/api/settings", { staff_mfa_required: "1" });
+    assert.equal(on.status, 200);
+    const again = await new Client(env.base).post("/api/login", { email: "admin@osvia.test", password: PASSWORD });
+    assert.equal(again.data.mfaRequired, true);
+  });
+
   test("state-changing requests need the CSRF token and same origin", async () => {
     const noToken = await fetch(`${env.base}/api/tickets`, { method: "POST", headers: { Cookie: ctx.custA.cookie, "Content-Type": "application/json" }, body: "{}" });
     assert.equal(noToken.status, 403);

@@ -460,6 +460,17 @@ export function dataTable({ columns, load, filters = [], searchPlaceholder = "Se
   return { el: wrap, refresh, params };
 }
 
+export function copyLinkButton() {
+  return button("Copy link", async () => {
+    try {
+      await navigator.clipboard.writeText(location.href);
+      toast("Link copied.");
+    } catch {
+      toast("Copy failed. Copy the address from the browser bar.", "error");
+    }
+  }, { kind: "ghost", iconName: "clip" });
+}
+
 export function pageHeader(title, subtitle = "", actions = []) {
   return h("header", { class: "page-head" }, h("div", {}, h("h1", {}, title), subtitle ? h("p", { class: "muted" }, subtitle) : null), h("div", { class: "page-actions" }, actions));
 }

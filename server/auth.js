@@ -10,7 +10,11 @@ const SESSION_SECONDS = 12 * 60 * 60;
 const IDLE_MINUTES = Number(process.env.SESSION_IDLE_MINUTES || 120);
 const INVITE_DAYS = 7;
 
-export function staffMfaRequired() {
+export function staffMfaRequired(db) {
+  if (db) {
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'staff_mfa_required'").get();
+    if (row) return row.value === "1";
+  }
   return process.env.REQUIRE_STAFF_MFA !== "false";
 }
 
@@ -26,7 +30,8 @@ export function requireStaff(actor) {
   requireRole(actor, ...STAFF_ROLES);
 }
 
-export function requireMfa(actor) {
+export function requireMfa(actor, db) {
+  if (!staffMfaRequired(db)) return;
   if (!actor.mfaEnabled || !actor.mfaVerified) {
     throw new HttpError(403, "Turn on two-factor authentication under Account before doing this.");
   }
@@ -109,8 +114,8 @@ export function tokensMatchCsrf(req, actor) {
   return tokensMatch(req.headers["x-csrf-token"], actor.csrfToken);
 }
 
-export function mustEnrollMfa(actor) {
-  return isStaff(actor) && staffMfaRequired() && !actor.mfaEnabled;
+export function mustEnrollMfa(actor, db) {
+  return isStaff(actor) && staffMfaRequired(db) && !actor.mfaEnabled;
 }
 
 function tooMany(db, bucket, limit, minutes) {
@@ -138,7 +143,7 @@ function createSession(db, req, userId, mfaVerified) {
     new Date(Date.now() + SESSION_SECONDS * 1000).toISOString(), now, now);
   db.prepare("UPDATE users SET last_login_at = ? WHERE id = ?").run(now, userId);
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
-  return reply(200, { user: publicUser(user), csrfToken, mustEnrollMfa: mustEnrollMfa(publicUser(user)) }, { "Set-Cookie": sessionCookie(raw, SESSION_SECONDS) });
+  return reply(200, { user: publicUser(user), csrfToken, mustEnrollMfa: mustEnrollMfa(publicUser(user), db) }, { "Set-Cookie": sessionCookie(raw, SESSION_SECONDS) });
 }
 
 export function needsSetup(db) {
@@ -184,7 +189,7 @@ export function login(ctx) {
     throw new HttpError(403, "This organization's access is suspended. Contact OSVIA TECHNOLOGIES.");
   }
   db.prepare("DELETE FROM login_attempts WHERE bucket = ?").run(bucket);
-  if (user.mfa_enabled === 1) {
+  if (user.mfa_enabled === 1 && staffMfaRequired(db)) {
     const challenge = randomId();
     db.prepare("INSERT INTO mfa_challenges (id, user_id, expires_at) VALUES (?, ?, ?)").run(hashToken(challenge), user.id, new Date(Date.now() + 5 * 60000).toISOString());
     return { mfaRequired: true, challenge };
@@ -225,7 +230,8 @@ export function me(ctx) {
     user: { ...publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(actor.id)) },
     organization: org,
     csrfToken: actor.csrfToken,
-    mustEnrollMfa: mustEnrollMfa(actor),
+    mustEnrollMfa: mustEnrollMfa(actor, db),
+    staffMfaRequired: staffMfaRequired(db),
     mfaVerified: actor.mfaVerified,
   };
 }
@@ -409,7 +415,7 @@ export function confirmMfa(ctx) {
 
 export function disableMfa(ctx) {
   const { db, actor, body } = ctx;
-  if (isStaff(actor) && staffMfaRequired()) throw new HttpError(400, "Staff accounts must keep two-factor authentication on.");
+  if (isStaff(actor) && staffMfaRequired(db)) throw new HttpError(400, "Staff accounts must keep two-factor authentication on.");
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(actor.id);
   if (!user.mfa_enabled || !verifyTotp(openSecret(user.mfa_secret), body.code)) throw new HttpError(400, "That code is not correct.");
   db.prepare("UPDATE users SET mfa_enabled = 0, mfa_secret = NULL WHERE id = ?").run(actor.id);

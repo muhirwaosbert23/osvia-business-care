@@ -3,7 +3,8 @@ import { accountPage, auditPage, myOrganizationPage, notificationsPage, organiza
 import { deviceDetailPage, devicesPage, maintenancePage, mapPage, remoteDeskPage } from "./pages-assets.js";
 import { invitePage, loginPage, registerPage, setupPage } from "./pages-auth.js";
 import { billingPage } from "./pages-billing.js";
-import { dashboardPage, ticketDetailPage, ticketsPage } from "./pages-main.js";
+import { dashboardPage, newTicketDialog, ticketDetailPage, ticketsPage } from "./pages-main.js";
+import { mountPalette, openPalette, rememberVisit } from "./palette.js";
 import { incidentDetailPage, incidentsPage, monitorDetailPage, monitoringPage, statusPage, windowsPage } from "./pages-ops.js";
 
 const root = document.getElementById("app");
@@ -93,7 +94,8 @@ function buildShell() {
         boot();
       }, { kind: "ghost small block", iconName: "logout" })));
   const toggle = h("button", { type: "button", class: "icon-btn menu-btn", "aria-label": "Open menu", onclick: () => document.body.classList.toggle("nav-open") }, icon("menu"));
-  const topbar = h("header", { class: "topbar" }, toggle, h("div", { class: "topbar-title" }, state.org ? state.org.name : "OSVIA TECHNOLOGIES"), live, h("div", { class: "spacer" }), themeBtn, bell, h("a", { href: "#/account", class: "icon-btn", title: "Account", "aria-label": "Account" }, icon("user")));
+  const finder = h("button", { type: "button", class: "finder", title: "Search or jump to a page (Ctrl+K)", onclick: () => openPalette() }, icon("search"), h("span", {}, "Search"), h("kbd", {}, "Ctrl K"));
+  const topbar = h("header", { class: "topbar" }, toggle, h("div", { class: "topbar-title" }, state.org ? state.org.name : "OSVIA TECHNOLOGIES"), finder, live, h("div", { class: "spacer" }), themeBtn, bell, h("a", { href: "#/account", class: "icon-btn", title: "Account", "aria-label": "Account" }, icon("user")));
   const scrim = h("div", { class: "scrim", onclick: () => document.body.classList.remove("nav-open") });
   clear(root, h("a", { href: "#main", class: "skip" }, "Skip to content"), h("div", { class: "layout" }, sidebar, scrim, h("div", { class: "content" }, topbar, main)));
   for (const item of NAV.filter((n) => n.roles.includes(state.me.role))) {
@@ -180,6 +182,10 @@ async function route({ silent = false } = {}) {
   }
   try {
     await (match.id ? match.handler(shell.main, match.id) : match.handler(shell.main, currentQuery()));
+    const title = shell.main.querySelector("h1")?.textContent?.trim();
+    if (title && title !== "Page not found" && title !== "Not available") {
+      rememberVisit({ href: location.hash, label: title, hint: NAV.find((item) => item.path === match.base)?.label || "Page" });
+    }
   } catch (error) {
     clear(shell.main, errorBox(error, route));
   }
@@ -270,4 +276,31 @@ window.addEventListener("hashchange", () => {
 });
 document.addEventListener("osvia:unread", refreshUnread);
 setInterval(refreshUnread, 60000);
+mountPalette({
+  pages() {
+    const pages = NAV.filter((item) => item.roles.includes(state.me.role)).map((item) => ({ href: `#/${item.path}`, label: item.label, hint: "Go to page" }));
+    pages.push({ href: "#/account", label: "Account", hint: "Go to page" }, { href: "#/notifications", label: "Notifications", hint: "Go to page" });
+    if (state.mustEnrollMfa) return pages.filter((item) => ["#/dashboard", "#/account", "#/notifications"].includes(item.href));
+    return pages;
+  },
+  actions() {
+    const staff = STAFF.includes(state.me.role);
+    const actions = [];
+    if (staff || state.org?.status === "active") actions.push({ label: "New ticket", hint: "Open the ticket form", run: () => newTicketDialog() });
+    if (staff) {
+      actions.push({ label: "Tickets assigned to me", hint: "Tickets", href: "#/tickets?assigned=me" });
+      actions.push({ label: "Unassigned tickets", hint: "Tickets", href: "#/tickets?assigned=none" });
+    }
+    actions.push({ label: "SLA breached tickets", hint: "Tickets", href: "#/tickets?breached=1" });
+    actions.push({
+      label: "Copy link to this page",
+      hint: location.hash || "#/dashboard",
+      run: async () => {
+        await navigator.clipboard.writeText(location.href);
+        toast("Link copied.");
+      },
+    });
+    return actions;
+  },
+});
 boot();

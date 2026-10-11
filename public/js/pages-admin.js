@@ -379,13 +379,23 @@ async function systemSettings(body) {
         }, { kind: "ghost small" }),
       ],
     }),
-    card("Security", definitionList([
-      ["Database schema", `Version ${s.schemaVersion}`],
-      ["Staff two-factor required", s.staffMfaRequired ? "Yes" : "No (set REQUIRE_STAFF_MFA=true)"],
-      ["Backups encrypted", s.backupEncrypted ? "Yes" : "No: set BACKUP_KEY"],
-      ["Email", s.smtpConfigured ? "Configured" : "Not configured: emails are recorded as skipped"],
-      ["MeshCentral", s.meshConfigured ? "Configured" : "Not configured"],
-    ])),
+    card("Security", [
+      definitionList([
+        ["Database schema", `Version ${s.schemaVersion}`],
+        ["Extra sign-in check", s.staffMfaRequired ? "On — authenticator code after email and password" : "Off — email and password only"],
+        ["Backups encrypted", s.backupEncrypted ? "Yes" : "No: set BACKUP_KEY"],
+        ["Email", s.smtpConfigured ? "Configured" : "Not configured: emails are recorded as skipped"],
+        ["MeshCentral", s.meshConfigured ? "Configured" : "Not configured"],
+      ]),
+      isRole("admin") ? h("p", { class: "muted small" }, s.staffMfaRequired
+        ? "Turn this off if you need to sign in with email and password only. Turn it on again when you want the extra check."
+        : "Turn this on when you want staff sign-in to ask for an authenticator code.") : null,
+      isRole("admin") ? button(s.staffMfaRequired ? "Turn off extra sign-in check" : "Require authenticator at sign-in", async () => {
+        await api("PATCH", "/api/settings", { staff_mfa_required: s.staffMfaRequired ? "0" : "1" });
+        toast(s.staffMfaRequired ? "Extra sign-in check is off. Email and password are enough." : "Extra sign-in check is on. Staff must use an authenticator code.");
+        systemSettings(body);
+      }, { kind: s.staffMfaRequired ? "ghost" : "primary" }) : null,
+    ]),
     card("Email queue", [definitionList(Object.entries(s.outbox).map(([k, v]) => [label(k), v])), s.recentEmailErrors.length ? h("div", { class: "table-scroll" }, h("table", { class: "table" }, h("thead", {}, h("tr", {}, ["When", "To", "Subject", "Attempts", "Error"].map((t) => h("th", {}, t)))), h("tbody", {}, s.recentEmailErrors.map((e) => h("tr", {}, h("td", {}, fmtDateTime(e.created_at)), h("td", {}, e.to_email), h("td", {}, e.subject), h("td", {}, e.attempts), h("td", {}, e.last_error)))))) : null]));
 }
 
@@ -409,7 +419,7 @@ export async function accountPage(main) {
   const reload = () => accountPage(main);
   const mfaBlock = u.mfaEnabled
     ? [h("p", {}, badge("ok", "On"), " Your sign-in requires a code from your authenticator app."),
-      isStaff() ? h("p", { class: "muted small" }, "Staff accounts must keep two-factor authentication on.") : button("Turn off", () => formDialog("Turn off two-factor", [{ name: "code", label: "Current code", required: true, inputmode: "numeric" }], async (values, close) => {
+      isStaff() && me.staffMfaRequired ? h("p", { class: "muted small" }, "Staff accounts must keep two-factor authentication on while the extra sign-in check is required in Settings.") : button("Turn off", () => formDialog("Turn off two-factor", [{ name: "code", label: "Current code", required: true, inputmode: "numeric" }], async (values, close) => {
         await api("POST", "/api/me/mfa/disable", values);
         close();
         reload();

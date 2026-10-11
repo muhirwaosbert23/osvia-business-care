@@ -544,6 +544,23 @@ a.kpi:hover { text-decoration: none; border-color: var(--brand); transform: tran
 .desk-steps { margin: 8px 0 0; padding-left: 18px; }
 .desk-steps code { font-size: 0.85em; }
 
+.finder { display: inline-flex; align-items: center; gap: 8px; height: 38px; min-width: 220px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); cursor: pointer; font: inherit; }
+.finder:hover { color: var(--text); border-color: var(--brand); }
+.finder kbd, .palette kbd { font: 0.72rem ui-monospace, Consolas, monospace; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; background: var(--surface); color: var(--muted); }
+.finder kbd { margin-left: auto; }
+.palette { width: min(640px, calc(100vw - 24px)); max-height: min(560px, calc(100vh - 48px)); margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+.palette::backdrop { background: rgb(6 16 32 / 48%); }
+.palette-search { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.palette-search input { flex: 1; min-width: 0; border: 0; background: transparent; color: inherit; font: inherit; outline: none; }
+.palette-list { max-height: min(420px, 58vh); overflow: auto; padding: 6px; }
+.palette-group { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); padding: 8px 10px 4px; }
+.palette-item { display: flex; width: 100%; text-align: left; gap: 10px; align-items: center; border: 0; background: transparent; color: inherit; border-radius: 8px; padding: 8px 10px; cursor: pointer; font: inherit; }
+.palette-item strong { font-weight: 650; }
+.palette-item.active, .palette-item:hover { background: var(--surface-2); }
+.palette-kind { flex: none; width: 108px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: var(--muted); }
+.palette-empty { padding: 14px 10px; }
+.palette-foot { display: flex; gap: 14px; padding: 8px 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.78rem; }
+
 @media (max-width: 1100px) {
   .detail { grid-template-columns: minmax(0, 1fr); }
   .dash-grid { grid-template-columns: minmax(0, 1fr); }
@@ -565,6 +582,8 @@ a.kpi:hover { text-decoration: none; border-color: var(--brand); transform: tran
   body.nav-open .sidebar { transform: none; }
   body.nav-open .scrim { display: block; position: fixed; inset: 0; background: rgb(6 16 32 / 45%); z-index: 20; }
   .menu-btn { display: inline-grid; }
+  .finder { min-width: 0; width: 38px; padding: 0; justify-content: center; }
+  .finder span, .finder kbd { display: none; }
   .main { padding: 16px; }
   .topbar { padding: 8px 12px; }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }

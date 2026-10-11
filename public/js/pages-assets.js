@@ -1,5 +1,5 @@
 import {
-  api, ASSET_TYPES, badge, button, card, clear, CONDITIONS, currentQuery, dataTable, definitionList, dialog, download, empty, enumOptions, errorBox, fmtDate,
+  api, ASSET_TYPES, badge, button, card, clear, CONDITIONS, copyLinkButton, currentQuery, dataTable, definitionList, dialog, download, empty, enumOptions, errorBox, fmtDate,
   fmtDateTime, fmtRelative, formDialog, h, isRole, isStaff, label, OPERATIONAL, orgOptions, pageHeader, skeleton, staffOptions, state, toast,
 } from "./core.js";
 import { historyCard, withReason } from "./history.js";
@@ -115,7 +115,7 @@ export async function deviceDetailPage(main, id) {
   const d = data.device;
   const staff = isStaff();
   const reload = () => deviceDetailPage(main, id);
-  const actions = [];
+  const actions = [copyLinkButton()];
   if ((staff || isRole("customer_admin")) && !d.archivedAt) actions.push(button("Edit", () => deviceDialog(d, reload), { kind: "ghost" }));
   if (staff && d.source !== "meshcentral" && d.address) actions.push(button("Check now", async () => {
     const r = await api("POST", `/api/devices/${d.id}/check`);

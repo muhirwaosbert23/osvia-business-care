@@ -11,6 +11,6 @@ echo Starting the MeshAgent on this PC...
 start "" /MIN "C:\Users\JOSCOM\Desktop\osvia-meshcentral\agents\meshagent64-OSVIATechnologies.exe" run --agentName=OSVIA-HOME-SERVER
 
 echo Opening the portal...
-start "" "http://127.0.0.1:3080/#/remote"
+start "" "http://192.168.1.4:3080/#/remote"
 
 node --experimental-sqlite --no-warnings=ExperimentalWarning server\index.js
