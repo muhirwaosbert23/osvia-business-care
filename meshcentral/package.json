@@ -1,0 +1,15 @@
+{
+  "name": "osvia-meshcentral",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local MeshCentral server for OSVIA Business Care remote desktop",
+  "scripts": {
+    "start": "node node_modules/meshcentral"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "loadavg-windows": "1.1.1",
+    "meshcentral": "^1.2.5",
+    "node-windows": "0.1.14"
+  }
+}

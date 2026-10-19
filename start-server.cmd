@@ -1,7 +1,8 @@
 @echo off
 title OSVIA Business Care
 cd /d "%~dp0"
-set "MESH=%~dp0..\osvia-meshcentral"
+set "MESH=%~dp0meshcentral"
+if not exist "%MESH%\node_modules\meshcentral\meshcentral.js" set "MESH=%~dp0..\osvia-meshcentral"
 
 echo Starting MeshCentral...
 if exist "%MESH%\node_modules\meshcentral\meshcentral.js" (

@@ -1,0 +1,6 @@
+node_modules/
+meshcentral-data/
+meshcentral-backups/
+meshcentral-files/
+agents/
+*.log

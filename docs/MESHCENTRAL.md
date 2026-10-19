@@ -1,6 +1,6 @@
 # MeshCentral integration
 
-> **Status:** verified on this office LAN against a live MeshCentral v1.2.5 server at `https://192.168.1.4:4430` (MeshCtrl `serverinfo`, device sync, and Desktop/Terminal/Files launch). Other sites still need their own MeshCentral URL and agent.
+> **Status:** the portal includes a local MeshCentral setup in `meshcentral/`. On this office PC it runs at `https://127.0.0.1:4430`. Certificates, the MeshCentral database, the agent, and login keys are created on the server and are not in git. Other sites still need their own URL and agent.
 
 ## What the portal does
 
@@ -29,7 +29,9 @@ Each launch is stored in the device's remote-session history and the audit log, 
 
 ## Setup
 
-1. Install MeshCentral on the server (or `docker compose --profile meshcentral up -d`) and finish its own setup in the browser.
+The `meshcentral/` folder in this repo is the local server: `package.json`, `config.example.json`, and `start-meshcentral.cmd`. From that folder run `npm install`, then `start-meshcentral.cmd`. The first start copies the example config and creates certificates. Point the portal `.env` at `https://127.0.0.1:4430` and `wss://127.0.0.1:4430`, and set `MESHCTRL_TLS_INSECURE=true` for that self-signed certificate.
+
+1. Install MeshCentral on the server (the included folder, or `docker compose --profile meshcentral up -d`) and finish its own setup in the browser.
 2. Get `meshctrl.js`: `npm install meshcentral` in a folder outside the portal, for example `/opt/meshctrl`. The file is `node_modules/meshcentral/meshctrl.js`.
 3. Run `node meshctrl.js --help` and confirm that your version supports `serverinfo`, `listdevices --id`, `--loginuser`, `--loginkeyfile` and `--logindomain`. If any option differs, stop and adjust `server/meshcentral.js` before going further.
 4. Create a dedicated MeshCentral user for the portal with read access to the customer device groups only.

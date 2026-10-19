@@ -1,0 +1,27 @@
+{
+  "settings": {
+    "cert": "127.0.0.1",
+    "port": 4430,
+    "aliasPort": 4430,
+    "redirPort": 0,
+    "mpsPort": 0,
+    "allowLoginToken": true,
+    "LANonly": true,
+    "localDiscovery": true,
+    "minify": true,
+    "selfUpdate": false,
+    "allowFraming": false,
+    "agentPing": 60,
+    "agentPong": 300,
+    "ignoreAgentHashCheck": true
+  },
+  "domains": {
+    "": {
+      "title": "OSVIA Remote Support",
+      "title2": "MeshCentral",
+      "newAccounts": false,
+      "userNameIsEmail": false,
+      "allowedorigin": true
+    }
+  }
+}
